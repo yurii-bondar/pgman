@@ -76,7 +76,11 @@ func adminSessionHandler(registry *PoolRegistry) func(pg *pgproto3.Backend) {
 // handleAdminQuery parses and dispatches one SQL string. Errors are
 // serialized as ErrorResponse; every path ends with ReadyForQuery.
 func handleAdminQuery(pg *pgproto3.Backend, registry *PoolRegistry, sql string) {
-	trimmed := strings.TrimRight(strings.TrimSpace(sql), ";")
+	// Trim trailing semicolons and whitespace together. Trimming only
+	// ";" left "SHOW POOLS " (note the space) for the very common
+	// "SHOW POOLS ;", which then missed the exact-match dispatch below
+	// and came back as a syntax error.
+	trimmed := strings.TrimRight(strings.TrimSpace(sql), "; \t\r\n")
 	upper := strings.ToUpper(trimmed)
 
 	switch {

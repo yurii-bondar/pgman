@@ -94,7 +94,7 @@ func (p *AuthQueryProvider) Lookup(user string) (scram.StoredCredentials, error)
 	if err != nil {
 		return scram.StoredCredentials{}, fmt.Errorf("connect: %w", err)
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	var username, passwd string
 	err = conn.QueryRow(ctx, p.query, user).Scan(&username, &passwd)

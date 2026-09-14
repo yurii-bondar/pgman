@@ -33,6 +33,14 @@ import (
 	"github.com/yurii-bondar/pgman/pool"
 )
 
+// hostResolver is the single method dnsWatcher needs from the DNS
+// layer. Declared here, at the consumer, rather than depending on the
+// concrete *net.Resolver — which also means a test can drive an address
+// change directly instead of standing up a DNS server to cause one.
+type hostResolver interface {
+	LookupHost(ctx context.Context, host string) ([]string, error)
+}
+
 // dnsWatcher periodically resolves host and triggers pool.Reconnect()
 // when the resolved IP set changes.
 type dnsWatcher struct {
@@ -40,7 +48,7 @@ type dnsWatcher struct {
 	host     string
 	pool     *pool.Pool
 	interval time.Duration
-	resolver *net.Resolver
+	resolver hostResolver
 
 	mu      sync.Mutex
 	lastIPs []string

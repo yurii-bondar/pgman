@@ -246,10 +246,7 @@ func TestStatsExposeWaiting(t *testing.T) {
 
 	// Give the second Acquire a moment to park.
 	deadline := time.After(time.Second)
-	for {
-		if p.Stats().Waiting >= 1 {
-			break
-		}
+	for p.Stats().Waiting < 1 {
 		select {
 		case <-deadline:
 			t.Fatalf("Stats().Waiting never reached 1; got %+v", p.Stats())

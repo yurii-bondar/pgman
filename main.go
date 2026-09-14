@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/yurii-bondar/pgman/pool"
@@ -158,8 +159,8 @@ func main() {
 	eventLog := NewEventLog(50)
 
 	promRegistry := prometheus.NewRegistry()
-	promRegistry.MustRegister(prometheus.NewGoCollector())
-	promRegistry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	promRegistry.MustRegister(collectors.NewGoCollector())
+	promRegistry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := newProxyMetrics(promRegistry)
 
 	poolRegistry := NewPoolRegistryWithDefaults(cfg.Pools, eventLog, cfg, func(name string) pool.ObserveWaitFunc {
@@ -392,7 +393,9 @@ func main() {
 	// restarts don't hit ENOTCONN / EADDRINUSE.
 	defer func() {
 		if unixListener != nil {
-			unixListener.Close()
+			if err := unixListener.Close(); err != nil {
+				slog.Warn("shutdown: unix listener close", "err", err)
+			}
 		}
 		if unixSockPath != "" {
 			_ = os.Remove(unixSockPath)
@@ -436,7 +439,10 @@ func main() {
 	// Step 1: Stop accepting new connections. Existing accepted
 	// handleConn goroutines keep running — their sessions must be
 	// allowed to complete cleanly.
-	listener.Close() // unblocks acceptLoop's Accept() with net.ErrClosed
+	// Unblocks acceptLoop's Accept() with net.ErrClosed.
+	if err := listener.Close(); err != nil {
+		slog.Warn("shutdown: listener close", "err", err)
+	}
 
 	// Step 2: Mark the data plane as draining. Sessions currently
 	// inside a transaction keep their backend and finish normally;
@@ -581,7 +587,7 @@ func acceptLoopWithOpts(listener net.Listener, router Router, authBackend AuthBa
 					opts.metrics.MaxConnRejected.Inc()
 				}
 				slog.Warn("max_client_conn reached, rejecting", "remote", client.RemoteAddr())
-				client.Close()
+				_ = client.Close()
 				continue
 			}
 		}
@@ -647,7 +653,7 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 		// then desynchronise the first message we send through the
 		// hijacked socket.
 		if err := pc.SyncConn(ctx); err != nil {
-			pc.Close(ctx)
+			_ = pc.Close(ctx)
 			return nil, fmt.Errorf("sync: %w", err)
 		}
 		hijacked, err := pc.Hijack()
@@ -710,7 +716,7 @@ func healthCheckWithTimeout(conn net.Conn, timeout time.Duration) error {
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return fmt.Errorf("set deadline: %w", err)
 	}
-	defer conn.SetDeadline(time.Time{})
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	fe := pgproto3.NewFrontend(conn, conn)
 	fe.Send(&pgproto3.Query{String: "SELECT 1"})
@@ -742,7 +748,7 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 	// rebind client to a *tls.Conn wrapping the original on SSL
 	// upgrade. A plain `defer client.Close()` would capture today's
 	// pre-upgrade value and skip a clean TLS close_notify.
-	defer func() { client.Close() }()
+	defer func() { _ = client.Close() }()
 
 	// client_login_timeout: bound the whole startup + auth handshake.
 	// Cleared on success so relay's per-message I/O isn't affected;
@@ -1708,7 +1714,7 @@ func runResetQuery(backend *backendConn, query string, timeout time.Duration) er
 	if err := backend.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return fmt.Errorf("set deadline: %w", err)
 	}
-	defer backend.SetDeadline(time.Time{})
+	defer func() { _ = backend.SetDeadline(time.Time{}) }()
 
 	fe := pgproto3.NewFrontend(backend, backend)
 	fe.Send(&pgproto3.Query{String: query})

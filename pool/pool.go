@@ -362,7 +362,7 @@ func (p *Pool) loadMeta(conn net.Conn) (connMeta, bool) {
 // a leaked entry pins the net.Conn and its buffers forever.
 func (p *Pool) retire(conn net.Conn) {
 	p.connMeta.Delete(conn)
-	conn.Close()
+	_ = conn.Close()
 }
 
 // Acquire blocks until a connection is available or ctx is done. Idle
@@ -543,7 +543,7 @@ func (p *Pool) Release(conn net.Conn) {
 	// Fast path: atomically check closed BEFORE taking mu.
 	if p.closed.Load() {
 		p.connMeta.Delete(conn)
-		conn.Close()
+		_ = conn.Close()
 		<-p.sem
 		return
 	}
@@ -556,7 +556,7 @@ func (p *Pool) Release(conn net.Conn) {
 	// this conn was dialed. Discard so the next Acquire dials fresh.
 	if haveMeta && meta.gen < p.reconnectGen.Load() {
 		p.connMeta.Delete(conn)
-		conn.Close()
+		_ = conn.Close()
 		<-p.sem
 		p.discards.Add(1)
 		p.emit("reconnect_discard", nil)
@@ -583,7 +583,7 @@ func (p *Pool) Release(conn net.Conn) {
 	if p.closed.Load() {
 		p.mu.Unlock()
 		p.connMeta.Delete(conn)
-		conn.Close()
+		_ = conn.Close()
 		<-p.sem
 		return
 	}
@@ -711,7 +711,7 @@ func (p *Pool) warmUp() {
 		p.mu.Lock()
 		if p.closed.Load() {
 			p.mu.Unlock()
-			conn.Close()
+			_ = conn.Close()
 			<-p.sem
 			return
 		}

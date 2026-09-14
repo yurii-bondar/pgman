@@ -101,7 +101,7 @@ func LoadHBAFile(path string) ([]HBARule, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hba: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var rules []HBARule
 	sc := bufio.NewScanner(f)

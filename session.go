@@ -306,7 +306,7 @@ func sendRealCancelRequest(addr string, pid uint32, secretKey []byte) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	_ = conn.SetWriteDeadline(time.Now().Add(cancelDialTimeout))
 

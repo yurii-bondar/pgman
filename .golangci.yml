@@ -2,12 +2,12 @@
 #
 # The enabled set is deliberately small. This is a proxy whose hot path
 # is a hand-written protocol loop; a linter that fights that style costs
-# more review time than it saves.
+# more review time than it saves. What is enabled catches the classes of
+# bug that actually bite a connection pooler: dropped errors, leaked
+# resources, and dead code that rots.
 #
-# The set below is what the tree passes cleanly today, so the check is a
-# real gate rather than a permanently-red badge people learn to ignore.
-# See the "backlog" block at the bottom for what is deliberately not
-# enabled yet and why.
+# The tree passes all of it cleanly, so a red check means a real
+# regression rather than inherited debt.
 
 version: "2"
 
@@ -21,8 +21,16 @@ linters:
   # enabled list below is the whole truth about what gates a PR.
   default: none
   enable:
+    # errcheck enforces the project's own rule that an error is part of
+    # a function's contract. Deliberate ignores are written as an
+    # explicit `_ =`, which stays greppable; silent drops do not.
+    - errcheck
     - govet
     - ineffassign
+    - staticcheck
+    # unused keeps dead code from accumulating. Two "legacy shim"
+    # functions had already survived the migration that obsoleted them.
+    - unused
     # bodyclose catches leaked response bodies in the admin HTTP and
     # OIDC paths — a slow FD leak that no test would notice.
     - bodyclose
@@ -32,30 +40,37 @@ linters:
     # misspell keeps the (heavily commented) codebase readable.
     - misspell
 
-  # ---- backlog: enable once the existing findings are triaged --------
-  #
-  # - errcheck     (50 findings, 19 outside _test.go) — mostly
-  #                Close/SetDeadline on paths we are already abandoning.
-  #                The project principles forbid discarding errors
-  #                outright, so each site needs a real decision rather
-  #                than a blanket `_ =`.
-  # - staticcheck  (5 findings)  — two deprecated prometheus collectors,
-  #                one QF hint in a test, and an SA4023 that is an
-  #                artifact of the non-Linux getPeerCred stub always
-  #                returning an error.
-  # - unused       (4 findings)  — dead code (interceptClientMsg,
-  #                warnListenIfPooled, extractSQL,
-  #                errAdminAuthNotConfigured). Removing it is the
-  #                author's call, not a lint autofix.
-
   exclusions:
     generated: lax
     rules:
       # templ-generated HTML builders are not hand-maintained.
       - path: _templ\.go
         linters:
+          - errcheck
+          - staticcheck
+          - unused
           - govet
           - ineffassign
+
+      # Test teardown legitimately ignores Close/Receive errors on
+      # connections it is about to abandon. Requiring `_ =` on every one
+      # of those would add noise to ~30 call sites without catching a
+      # single real bug.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+      # SA4023 fires on `if err != nil` after getPeerCred because the
+      # non-Linux build of that function (peer_cred_other.go) always
+      # returns an error, making the comparison trivially true on the
+      # platform the linter happens to run on. On Linux — the only
+      # platform where SO_PEERCRED exists and METHOD=peer is reachable —
+      # the check is load-bearing. Removing it to satisfy the linter
+      # would delete a real error path.
+      - path: hba\.go
+        text: "SA4023"
+        linters:
+          - staticcheck
 
 formatters:
   enable:

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/subtle"
-	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -295,12 +294,6 @@ func generateAdminPasswordHash(password string) (string, error) {
 	}
 	return string(h), nil
 }
-
-// errAdminAuthNotConfigured is a sentinel returned by loadOIDCVerifier
-// (and similar future helpers) so main.go can distinguish "operator
-// didn't configure this backend" (skip silently) from "operator
-// configured it but it doesn't work" (fatal at startup).
-var errAdminAuthNotConfigured = errors.New("admin auth backend not configured")
 
 // buildOIDCVerifier is a thin factory main.go calls at startup so the
 // heavy `oidc.NewProvider(ctx, issuer)` network round-trip only fires

@@ -15,14 +15,11 @@ package main
 import (
 	"log/slog"
 	"strings"
-
-	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// checkListenWarn is the hot-path variant used by processClientMsg —
-// it takes an already-extracted SQL string (avoids the second
-// extractSQL call and its type switch). Caller must have already
-// checked sess.listenWarned to short-circuit.
+// checkListenWarn takes SQL text that processClientMsg has already
+// extracted, so this does not repeat that type switch. Caller must have
+// already checked sess.listenWarned to short-circuit.
 func checkListenWarn(sess *session, sql string) {
 	// Session pooling holds one backend for the whole client lifetime,
 	// so LISTEN works fine there. Transaction & statement pooling
@@ -50,30 +47,4 @@ func checkListenWarn(sess *session, sql string) {
 		"user", sess.user,
 		"database", sess.database,
 		"pool_mode", sess.poolMode)
-}
-
-// warnListenIfPooled is the legacy entry point kept for compatibility
-// with any callers not yet migrated to processClientMsg.
-//
-// Deprecated: processClientMsg is the fused hot-path replacement.
-func warnListenIfPooled(sess *session, msg pgproto3.FrontendMessage) {
-	if sess == nil || sess.listenWarned {
-		return
-	}
-	if sql := extractSQL(msg); sql != "" {
-		checkListenWarn(sess, sql)
-	}
-}
-
-// extractSQL pulls the SQL text out of the two frontend messages that
-// carry it: Query (simple protocol) and Parse (extended protocol).
-// Returns "" for messages that don't carry SQL.
-func extractSQL(msg pgproto3.FrontendMessage) string {
-	switch m := msg.(type) {
-	case *pgproto3.Query:
-		return m.String
-	case *pgproto3.Parse:
-		return m.Query
-	}
-	return ""
 }

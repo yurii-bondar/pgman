@@ -12,6 +12,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -63,8 +64,15 @@ func openUnixSocket(socketDir, listenAddr, modeStr string) (net.Listener, string
 		}
 	}
 	if err := os.Chmod(sockPath, mode); err != nil {
-		ln.Close()
-		os.Remove(sockPath)
+		// Best-effort cleanup on a path we're already failing out of.
+		// Logged rather than dropped: a socket file left behind makes
+		// the next start fail with a confusing EADDRINUSE.
+		if cerr := ln.Close(); cerr != nil {
+			slog.Warn("unix socket: close after failed chmod", "path", sockPath, "err", cerr)
+		}
+		if rerr := os.Remove(sockPath); rerr != nil {
+			slog.Warn("unix socket: remove after failed chmod", "path", sockPath, "err", rerr)
+		}
 		return nil, "", fmt.Errorf("chmod %s: %w", sockPath, err)
 	}
 

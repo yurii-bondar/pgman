@@ -141,11 +141,21 @@ func sseHandler(registry *PoolRegistry, eventLog *EventLog) http.HandlerFunc {
 			if err := c.Render(r.Context(), &buf); err != nil {
 				return err
 			}
-			fmt.Fprintf(w, "event: %s\n", name)
-			for _, line := range strings.Split(buf.String(), "\n") {
-				fmt.Fprintf(w, "data: %s\n", line)
+			// A write error is how a closed browser tab announces
+			// itself here, so it has to end the stream. Ignoring it
+			// left the goroutine ticking against a dead socket until
+			// something else happened to notice.
+			if _, err := fmt.Fprintf(w, "event: %s\n", name); err != nil {
+				return err
 			}
-			fmt.Fprint(w, "\n\n")
+			for _, line := range strings.Split(buf.String(), "\n") {
+				if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprint(w, "\n\n"); err != nil {
+				return err
+			}
 			return nil
 		}
 
