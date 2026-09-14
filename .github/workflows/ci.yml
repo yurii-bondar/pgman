@@ -1,0 +1,189 @@
+# Default CI for every push and pull request.
+#
+# Split into independent jobs rather than one long script so a failure
+# names itself in the checks list: "race" failing is a very different
+# signal from "lint" failing, and waiting for lint to finish before
+# learning the tests are broken wastes the review loop.
+#
+# The perf suite is deliberately not here — it needs a dedicated runner
+# profile and ~2min, and lives in perf.yml behind a label.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same PR makes the previous run irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build & vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            tests/integration/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # tests/integration is its own module and is not covered by the
+      # commands above — a broken harness should fail here, not weeks
+      # later when someone runs the integration suite by hand.
+      - name: go vet (integration module)
+        working-directory: tests/integration
+        run: go vet -tags integration ./...
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  test:
+    name: unit tests (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # -race is not optional for this project: the pool, the session
+      # registry and the relay all share state across goroutines, and a
+      # data race there is a silent wrong answer under load, not a crash.
+      - name: go test -race
+        run: go test -race -count=1 -timeout 10m -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  integration:
+    name: integration (real postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pgman_test
+          POSTGRES_PASSWORD: pgman_test
+          POSTGRES_DB: pgman_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pgman_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      PGMAN_TEST_PG_DSN: "postgres://pgman_test:pgman_test@127.0.0.1:5432/pgman_test?sslmode=disable"
+      PGMAN_TEST_RACE: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            tests/integration/go.sum
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -h 127.0.0.1 -p 5432 -U pgman_test && exit 0
+            sleep 1
+          done
+          echo "Postgres never came up" >&2
+          exit 1
+
+      # Excludes the soak/benchmark tests, which belong to perf.yml —
+      # this job is about protocol and pooling correctness against a real
+      # server, and must stay fast enough to gate every PR.
+      - name: go test -tags integration
+        working-directory: tests/integration
+        run: |
+          go test -tags integration -race -count=1 -timeout 15m \
+            -run '^Test' -skip '^(TestPgbenchStyleMix|TestSoakSustained)$' ./...
+
+  docker:
+    name: docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Build only — publishing is a release concern, not a PR concern.
+      # This exists so a Dockerfile break is caught by the PR that causes
+      # it rather than by whoever next cuts a release.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

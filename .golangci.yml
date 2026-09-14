@@ -1,0 +1,62 @@
+# golangci-lint configuration for pgman.
+#
+# The enabled set is deliberately small. This is a proxy whose hot path
+# is a hand-written protocol loop; a linter that fights that style costs
+# more review time than it saves.
+#
+# The set below is what the tree passes cleanly today, so the check is a
+# real gate rather than a permanently-red badge people learn to ignore.
+# See the "backlog" block at the bottom for what is deliberately not
+# enabled yet and why.
+
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags:
+    - integration
+
+linters:
+  # Start from nothing rather than golangci-lint's default set, so the
+  # enabled list below is the whole truth about what gates a PR.
+  default: none
+  enable:
+    - govet
+    - ineffassign
+    # bodyclose catches leaked response bodies in the admin HTTP and
+    # OIDC paths — a slow FD leak that no test would notice.
+    - bodyclose
+    # copyloopvar is a no-op under Go 1.22+ loop semantics, but catches
+    # the pre-1.22 `v := v` idiom being reintroduced out of habit.
+    - copyloopvar
+    # misspell keeps the (heavily commented) codebase readable.
+    - misspell
+
+  # ---- backlog: enable once the existing findings are triaged --------
+  #
+  # - errcheck     (50 findings, 19 outside _test.go) — mostly
+  #                Close/SetDeadline on paths we are already abandoning.
+  #                The project principles forbid discarding errors
+  #                outright, so each site needs a real decision rather
+  #                than a blanket `_ =`.
+  # - staticcheck  (5 findings)  — two deprecated prometheus collectors,
+  #                one QF hint in a test, and an SA4023 that is an
+  #                artifact of the non-Linux getPeerCred stub always
+  #                returning an error.
+  # - unused       (4 findings)  — dead code (interceptClientMsg,
+  #                warnListenIfPooled, extractSQL,
+  #                errAdminAuthNotConfigured). Removing it is the
+  #                author's call, not a lint autofix.
+
+  exclusions:
+    generated: lax
+    rules:
+      # templ-generated HTML builders are not hand-maintained.
+      - path: _templ\.go
+        linters:
+          - govet
+          - ineffassign
+
+formatters:
+  enable:
+    - gofmt

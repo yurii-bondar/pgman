@@ -1,0 +1,386 @@
+package web
+
+import "fmt"
+
+// PoolRow is one pool's Stats() snapshot, shaped for display. It's plain
+// data — web package knows nothing about pool.Pool itself, so it can't
+// accidentally hold a lock or touch the hot Acquire/Release path.
+type PoolRow struct {
+	Name           string
+	Limit          int
+	InUse          int
+	Idle           int
+	AcquireTotal   int64
+	AcquireSeconds float64
+	Discards       int64
+	DialErrors     int64
+}
+
+// Saturated is true when every slot is checked out — the next Acquire on
+// this pool will block. It's the one number an operator glancing at the
+// dashboard actually needs highlighted.
+func (r PoolRow) Saturated() bool {
+	return r.Limit > 0 && r.InUse >= r.Limit
+}
+
+// SessionRow is one connected client's state for the sessions panel — a
+// SHOW CLIENTS-equivalent. Durations are pre-formatted server-side at
+// render time; since this lives inside the SSE refresh cycle, they simply
+// stay current on their own without any client-side clock code.
+type SessionRow struct {
+	PID          uint32
+	User         string
+	Database     string
+	Active       bool // holding a backend mid-transaction right now
+	ConnectedFor string
+	TxFor        string // "" when idle
+}
+
+// EventRow is one pool.EventFunc firing, formatted for display.
+type EventRow struct {
+	Time string
+	Pool string
+	Kind string
+	Err  string
+}
+
+// ManageRow is one pool's identity + current limit, for the control panel —
+// deliberately separate from PoolRow: the live stats table refreshes every
+// 500ms over SSE, but the management panel must not, or an in-progress
+// resize input would get reset out from under the operator mid-edit.
+type ManageRow struct {
+	Name  string
+	Limit int
+}
+
+templ pageStyle() {
+	<style>
+		:root {
+			--bg: #f7f8fa;
+			--surface: #ffffff;
+			--border: #e2e5ea;
+			--text: #1a1d23;
+			--text-dim: #6b7280;
+			--accent: #2563eb;
+			--accent-dim: #eff4ff;
+			--danger: #dc2626;
+			--danger-dim: #fef2f2;
+			--ok: #16a34a;
+			--warn: #d97706;
+			--warn-dim: #fffbeb;
+			--radius: 8px;
+			--mono: "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+		}
+		@media (prefers-color-scheme: dark) {
+			:root {
+				--bg: #14161a;
+				--surface: #1c1f26;
+				--border: #2c313b;
+				--text: #e7e9ec;
+				--text-dim: #8b929e;
+				--accent: #5b8dfa;
+				--accent-dim: #1b2333;
+				--danger: #f87171;
+				--danger-dim: #2a1717;
+				--ok: #4ade80;
+				--warn: #fbbf24;
+				--warn-dim: #2a220f;
+			}
+		}
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			padding: 2.5rem clamp(1rem, 4vw, 3rem);
+			background: var(--bg);
+			color: var(--text);
+			font: 15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+		}
+		.shell { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.5rem; }
+		h1 { font-size: 1.15rem; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+		h1 .dim { color: var(--text-dim); font-weight: 400; }
+		h2 { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin: 0 0 0.75rem; }
+		.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem 1.5rem; }
+		table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+		th { text-align: right; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); padding: 0 0.6rem 0.5rem; }
+		th:first-child, td:first-child { text-align: left; }
+		td { text-align: right; padding: 0.55rem 0.6rem; border-top: 1px solid var(--border); font-family: var(--mono); font-size: 0.88rem; }
+		td:first-child { font-family: inherit; font-weight: 500; }
+		tr.saturated td { color: var(--warn); }
+		.badge { display: inline-block; font-size: 0.68rem; font-weight: 600; padding: 0.1rem 0.4rem; border-radius: 4px; background: var(--warn-dim); color: var(--warn); margin-left: 0.4rem; font-family: inherit; }
+		.dim-col { color: var(--text-dim); }
+		.manage-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 0; border-top: 1px solid var(--border); }
+		.manage-row:first-of-type { border-top: none; }
+		.manage-row .name { flex: 1; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.inline-form { display: flex; align-items: center; gap: 0.4rem; margin: 0; }
+		input[type="number"], input[type="text"] {
+			background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+			color: var(--text); padding: 0.35rem 0.5rem; font: inherit; font-family: var(--mono);
+		}
+		input[type="number"] { width: 4.5rem; }
+		input[type="text"] { width: 100%; font-family: inherit; }
+		input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+		button {
+			border: 1px solid var(--border); background: var(--surface); color: var(--text);
+			border-radius: 6px; padding: 0.35rem 0.75rem; font: inherit; font-weight: 500; cursor: pointer;
+		}
+		button:hover { border-color: var(--accent); color: var(--accent); }
+		button.danger:hover { border-color: var(--danger); color: var(--danger); background: var(--danger-dim); }
+		button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+		button.primary:hover { opacity: 0.9; color: white; }
+		details { margin-top: 1rem; }
+		summary { cursor: pointer; font-size: 0.85rem; color: var(--accent); font-weight: 500; user-select: none; }
+		.add-form { display: grid; grid-template-columns: 1fr; gap: 0.6rem; margin-top: 0.9rem; max-width: 32rem; }
+		.add-form label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.78rem; color: var(--text-dim); }
+		.notice { padding: 0.6rem 0.9rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 0.9rem; background: var(--accent-dim); color: var(--accent); }
+		.notice.error { background: var(--danger-dim); color: var(--danger); }
+		.notice:empty { display: none; }
+		.state-active, .state-idle {
+			font-family: inherit; font-size: 0.72rem; font-weight: 600; padding: 0.1rem 0.5rem; border-radius: 999px;
+		}
+		.state-active { background: var(--warn-dim); color: var(--warn); }
+		.state-idle { background: var(--bg); color: var(--text-dim); }
+		.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
+		.card-header h2 { margin: 0; }
+		.card-header form { margin: 0; }
+		.card-header button { font-size: 0.78rem; padding: 0.3rem 0.6rem; }
+		.tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border); }
+		.tab-btn {
+			border: none; background: none; color: var(--text-dim); cursor: pointer;
+			font: inherit; font-weight: 500; padding: 0.6rem 0.9rem; margin-bottom: -1px;
+			border-bottom: 2px solid transparent; border-radius: 0;
+		}
+		.tab-btn:hover { color: var(--text); border-color: var(--border); }
+		.tab-btn.active { color: var(--accent); border-color: var(--accent); }
+		.tab-panel[hidden] { display: none; }
+	</style>
+	<script>
+		function showTab(id) {
+			document.querySelectorAll('.tab-panel').forEach(function(el) {
+				el.hidden = el.id !== 'tab-' + id;
+			});
+			document.querySelectorAll('.tab-btn').forEach(function(el) {
+				el.classList.toggle('active', el.dataset.tab === id);
+			});
+			if (history.replaceState) {
+				history.replaceState(null, '', '#' + id);
+			}
+		}
+		document.addEventListener('DOMContentLoaded', function() {
+			showTab(location.hash.replace('#', '') || 'status');
+		});
+	</script>
+}
+
+templ PoolsTable(rows []PoolRow) {
+	<table>
+		<thead>
+			<tr>
+				<th>Pool</th>
+				<th>In use / limit</th>
+				<th>Idle</th>
+				<th class="dim-col">Acquire calls</th>
+				<th class="dim-col">Acquire time</th>
+				<th class="dim-col">Discards</th>
+				<th class="dim-col">Dial errors</th>
+			</tr>
+		</thead>
+		<tbody>
+			if len(rows) == 0 {
+				<tr><td colspan="7" class="dim-col">No pools configured.</td></tr>
+			}
+			for _, r := range rows {
+				<tr class={ templ.KV("saturated", r.Saturated()) }>
+					<td>{ r.Name }</td>
+					<td>
+						{ fmt.Sprintf("%d / %d", r.InUse, r.Limit) }
+						if r.Saturated() {
+							<span class="badge">full</span>
+						}
+					</td>
+					<td>{ fmt.Sprintf("%d", r.Idle) }</td>
+					<td class="dim-col">{ fmt.Sprintf("%d", r.AcquireTotal) }</td>
+					<td class="dim-col">{ fmt.Sprintf("%.3fs", r.AcquireSeconds) }</td>
+					<td class="dim-col">{ fmt.Sprintf("%d", r.Discards) }</td>
+					<td class="dim-col">{ fmt.Sprintf("%d", r.DialErrors) }</td>
+				</tr>
+			}
+		</tbody>
+	</table>
+}
+
+templ SessionsTable(rows []SessionRow) {
+	<table>
+		<thead>
+			<tr>
+				<th>PID</th>
+				<th>User</th>
+				<th>Database</th>
+				<th>State</th>
+				<th>Connected</th>
+				<th>Tx time</th>
+				<th></th>
+			</tr>
+		</thead>
+		<tbody>
+			if len(rows) == 0 {
+				<tr><td colspan="7" class="dim-col">No active sessions.</td></tr>
+			}
+			for _, r := range rows {
+				<tr>
+					<td class="dim-col">{ fmt.Sprintf("%d", r.PID) }</td>
+					<td>{ r.User }</td>
+					<td>{ r.Database }</td>
+					<td>
+						if r.Active {
+							<span class="state-active">active</span>
+						} else {
+							<span class="state-idle">idle</span>
+						}
+					</td>
+					<td class="dim-col">{ r.ConnectedFor }</td>
+					<td class="dim-col">{ r.TxFor }</td>
+					<td>
+						if r.Active {
+							<form class="inline-form" hx-post={ fmt.Sprintf("/sessions/%d/cancel", r.PID) } hx-swap="none" hx-confirm="Cancel this session's current query?">
+								<button type="submit" class="danger">Cancel</button>
+							</form>
+						}
+					</td>
+				</tr>
+			}
+		</tbody>
+	</table>
+}
+
+templ RecentEvents(rows []EventRow) {
+	<table>
+		<thead>
+			<tr><th>Time</th><th>Pool</th><th>Kind</th><th>Error</th></tr>
+		</thead>
+		<tbody>
+			if len(rows) == 0 {
+				<tr><td colspan="4" class="dim-col">No errors recorded since startup.</td></tr>
+			}
+			for _, r := range rows {
+				<tr>
+					<td class="dim-col">{ r.Time }</td>
+					<td>{ r.Pool }</td>
+					<td>{ r.Kind }</td>
+					<td class="dim-col">{ r.Err }</td>
+				</tr>
+			}
+		</tbody>
+	</table>
+}
+
+templ ReloadResult(lines []string, isError bool) {
+	<div id="reload-result" class={ "notice", templ.KV("error", isError) }>
+		for i, l := range lines {
+			if i > 0 {
+				<br/>
+			}
+			{ l }
+		}
+	</div>
+}
+
+// ManagePanel is a standalone fragment: rendered on first page load, and
+// re-rendered wholesale as the direct response to every add/resize/remove
+// action (hx-swap="outerHTML"). It never sits inside the SSE-refreshed
+// zone, so a resize input mid-edit is never at risk of being reset by the
+// live stats ticking in the background.
+templ ManagePanel(rows []ManageRow, message string, isError bool) {
+	<div id="manage-panel" class="card">
+		<h2>Manage pools</h2>
+		if message != "" {
+			<div class={ "notice", templ.KV("error", isError) }>{ message }</div>
+		}
+		if len(rows) == 0 {
+			<p class="dim-col">No pools configured.</p>
+		}
+		for _, r := range rows {
+			<div class="manage-row">
+				<span class="name">{ r.Name }</span>
+				<form class="inline-form" hx-post={ "/pools/" + r.Name + "/resize" } hx-target="#manage-panel" hx-swap="outerHTML">
+					<input type="number" name="limit" min="1" value={ fmt.Sprintf("%d", r.Limit) }/>
+					<button type="submit">Resize</button>
+				</form>
+				<form class="inline-form" hx-post={ "/pools/" + r.Name + "/remove" } hx-target="#manage-panel" hx-swap="outerHTML" hx-confirm={ "Remove pool \"" + r.Name + "\"? Active sessions finish first, then it's gone." }>
+					<button type="submit" class="danger">Remove</button>
+				</form>
+			</div>
+		}
+		<details>
+			<summary>+ Add pool</summary>
+			<form class="add-form" hx-post="/pools" hx-target="#manage-panel" hx-swap="outerHTML">
+				<label>Name
+					<input type="text" name="name" required placeholder="e.g. analytics"/>
+				</label>
+				<label>Backend DSN
+					<input type="text" name="backend_dsn" required placeholder="postgres://user:pass@host:5432/db?sslmode=disable"/>
+				</label>
+				<label>Backend address (for CancelRequest)
+					<input type="text" name="backend_addr" required placeholder="host:5432"/>
+				</label>
+				<label>Limit
+					<input type="number" name="limit" min="1" value="2" required/>
+				</label>
+				<button type="submit" class="primary">Add pool</button>
+			</form>
+		</details>
+	</div>
+}
+
+templ Page(rows []PoolRow, sessionRows []SessionRow, eventRows []EventRow, manageRows []ManageRow) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>pgman — pools</title>
+			<script src="https://unpkg.com/htmx.org@2.0.4"></script>
+			<script src="https://unpkg.com/htmx-ext-sse@2.2.2"></script>
+			@pageStyle()
+		</head>
+		<body>
+			<div class="shell" hx-ext="sse" sse-connect="/events">
+				<div class="card-header">
+					<h1>pgman <span class="dim">/ connection pools</span></h1>
+					<form hx-post="/reload" hx-target="#reload-result" hx-swap="outerHTML">
+						<button type="submit">Reload config (dry-run diff)</button>
+					</form>
+				</div>
+				<div class="notice" id="reload-result"></div>
+
+				<nav class="tabs">
+					<button type="button" class="tab-btn active" data-tab="status" onclick="showTab('status')">Live status</button>
+					<button type="button" class="tab-btn" data-tab="sessions" onclick="showTab('sessions')">Sessions</button>
+					<button type="button" class="tab-btn" data-tab="manage" onclick="showTab('manage')">Manage pools</button>
+					<button type="button" class="tab-btn" data-tab="errors" onclick="showTab('errors')">Recent errors</button>
+				</nav>
+
+				<div id="tab-status" class="tab-panel card">
+					<div id="pools" sse-swap="pools">
+						@PoolsTable(rows)
+					</div>
+				</div>
+
+				<div id="tab-sessions" class="tab-panel card" hidden?={ true }>
+					<div id="sessions" sse-swap="sessions">
+						@SessionsTable(sessionRows)
+					</div>
+				</div>
+
+				<div id="tab-manage" class="tab-panel" hidden?={ true }>
+					@ManagePanel(manageRows, "", false)
+				</div>
+
+				<div id="tab-errors" class="tab-panel card" hidden?={ true }>
+					<div id="events" sse-swap="events">
+						@RecentEvents(eventRows)
+					</div>
+				</div>
+			</div>
+		</body>
+	</html>
+}

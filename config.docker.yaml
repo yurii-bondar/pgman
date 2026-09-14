@@ -1,0 +1,44 @@
+# config.docker.yaml — LOCAL DEVELOPMENT ONLY. NOT A PRODUCTION SAMPLE.
+#
+# This file configures the throwaway stack in docker-compose.yaml: trust
+# auth, no TLS, no admin credentials, a database whose password is in the
+# repository. It is safe only because every port in that compose file is
+# bound to 127.0.0.1.
+#
+# For a config you can actually build on, start from config.yaml.
+#
+# Copying this file to a server is enough to expose an unauthenticated
+# Postgres proxy — and, through the virtual admin database, PAUSE/RESUME/
+# RECONNECT on every pool.
+
+listen_addr: ":6435"
+metrics_addr: ":8080"
+admin_addr: "0.0.0.0:8081"
+
+# No TLS / no admin auth in the dev compose — loopback-only admin.
+
+max_client_conn: 1000
+client_login_timeout: 30s
+query_wait_timeout: 30s
+server_reset_query: "DISCARD ALL"
+
+# Pool lifecycle.
+server_idle_timeout: 5m
+server_lifetime: 30m
+server_check_delay: 10s
+min_pool_size: 2
+
+log_format: text
+log_level: info
+
+# No auth_users ⇒ trust auth: every client is accepted without a
+# password. This is only tolerable because docker-compose.yaml publishes
+# port 6435 on 127.0.0.1. Remove that binding and this line becomes an
+# open door. In production configure auth_users (SCRAM) instead.
+allow_insecure_trust_auth: true
+
+pools:
+  pgman_test:
+    backend_dsn: "postgres://pgman_test:pgman_test@postgres:5432/pgman_test?sslmode=disable"
+    backend_addr: "postgres:5432"
+    limit: 20

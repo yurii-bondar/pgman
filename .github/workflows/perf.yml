@@ -1,0 +1,150 @@
+# Native-Linux performance profile for pgman.
+#
+# Runs on ubuntu-latest (bare-metal networking, no macOS docker-desktop
+# VM overhead), against a Postgres service container reachable over the
+# host network. This is the "real prod ceiling" measurement — the
+# numbers here are what operators should expect on a Linux node in
+# production, unlike the macOS docker-desktop dev-loop numbers.
+#
+# Two axes of measurement:
+#
+#   1. BenchmarkProxyConcurrent vs BenchmarkDirectConcurrent — the pure
+#      per-op overhead the proxy adds versus talking to Postgres
+#      directly with pgx. This is the number that regresses (or wins)
+#      when hot-path code changes.
+#
+#   2. TestPgbenchStyleMix — realistic soak with a multi-column query
+#      that has real backend work, so proxy overhead amortizes. This
+#      is what dashboards / alerting should baseline against.
+#
+# Triggers: manual (workflow_dispatch) + weekly cron + on labeled PR
+# so contributors can opt into the (slow, ~2min) job when their change
+# touches hot paths.
+
+name: perf
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * 1" # every Monday 03:00 UTC
+  pull_request:
+    types: [opened, labeled, synchronize]
+    paths:
+      - "**/*.go"
+      - ".github/workflows/perf.yml"
+
+jobs:
+  perf:
+    # Only run on PRs when explicitly labeled — the job takes ~2min and
+    # noise adds up. Manual/cron always run.
+    if: >
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pgman_test
+          POSTGRES_PASSWORD: pgman_test
+          POSTGRES_DB: pgman_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pgman_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # Pgman's integration harness reads this. Point at the
+      # service container mapped to localhost:5432 (host networking on
+      # GH runners is native — no VM in the way).
+      PGMAN_TEST_PG_DSN: "postgres://pgman_test:pgman_test@127.0.0.1:5432/pgman_test?sslmode=disable"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            tests/integration/go.sum
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -h 127.0.0.1 -p 5432 -U pgman_test && exit 0
+            sleep 1
+          done
+          echo "Postgres never came up" >&2
+          exit 1
+
+      - name: Micro-benchmarks (per-op overhead)
+        working-directory: tests/integration
+        run: |
+          set -euo pipefail
+          echo "### Micro-benchmark: proxy vs direct" > "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Direct: pgx → PG.
+          echo "=== BenchmarkDirectConcurrent ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -tags integration -timeout 5m \
+            -bench '^BenchmarkDirectConcurrent$' \
+            -benchtime=10s -run '^$' . \
+            2>&1 | grep -E 'Benchmark|ok|FAIL' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Proxy: pgx → pgman → PG.
+          echo "=== BenchmarkProxyConcurrent ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -tags integration -timeout 5m \
+            -bench '^BenchmarkProxyConcurrent$' \
+            -benchtime=10s -run '^$' . \
+            2>&1 | grep -E 'Benchmark|ok|FAIL' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Soak (pgbench-style realistic mix)
+        working-directory: tests/integration
+        env:
+          PGBENCH_DURATION: "30s"
+          PGBENCH_CONCURRENCY: "200"
+          PGBENCH_POOL_LIMIT: "80"
+        run: |
+          set -euo pipefail
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Soak (pgbench-style, ${PGBENCH_DURATION}, ${PGBENCH_CONCURRENCY} workers, pool=${PGBENCH_POOL_LIMIT})" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          go test -tags integration -timeout 5m -v \
+            -run '^TestPgbenchStyleMix$' . \
+            2>&1 | grep -E 'ops|latency|Throughput|QPS|Total|Failed|PASS|FAIL' \
+                 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Regression guard — proxy must sustain ≥30K QPS
+        working-directory: tests/integration
+        env:
+          PGBENCH_DURATION: "20s"
+          PGBENCH_CONCURRENCY: "150"
+          PGBENCH_POOL_LIMIT: "50"
+        run: |
+          set -euo pipefail
+          # Re-run with a tighter config and grep the QPS. Fail the job
+          # if we regressed below 30K — the whole point of the linux
+          # runner is that we should easily clear this bar. Adjust as
+          # baselines drift.
+          out=$(go test -tags integration -timeout 5m -v \
+                  -run '^TestPgbenchStyleMix$' . 2>&1)
+          echo "$out" | grep -E 'Throughput|QPS|Total|latency' || true
+          qps=$(echo "$out" | grep -oE 'Throughput:[[:space:]]+[0-9]+' | grep -oE '[0-9]+$' || echo 0)
+          echo "measured QPS: $qps"
+          if [ "$qps" -lt 30000 ]; then
+            echo "::warning::pgman pgbench throughput ${qps} < 30000 QPS target on Linux runner"
+            # Warning only for now — flip to `exit 1` once baseline is stable.
+          fi

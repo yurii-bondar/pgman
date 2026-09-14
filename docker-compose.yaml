@@ -1,0 +1,62 @@
+# docker-compose.yaml — dev / CI environment for pgman.
+#
+# Usage:
+#   docker compose up -d              # start Postgres + pgman
+#   docker compose up -d postgres     # Postgres only (for integration tests)
+#   docker compose down -v            # tear down + remove volumes
+#
+# Integration tests:
+#   docker compose up -d postgres
+#   PGMAN_TEST_PG_DSN="postgres://pgman_test:pgman_test@127.0.0.1:15432/pgman_test?sslmode=disable" \
+#     go test -tags integration -race -timeout 120s -v ./...
+
+services:
+  # ---- Real Postgres for integration / soak tests --------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pgman_test
+      POSTGRES_PASSWORD: pgman_test
+      POSTGRES_DB: pgman_test
+    ports:
+      # Bound to loopback: this database has a well-known password and
+      # exists only to back local tests.
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgman_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    # Tune for CI speed, not durability.
+    command: >
+      postgres
+        -c shared_buffers=128MB
+        -c max_connections=200
+        -c fsync=off
+        -c synchronous_commit=off
+        -c full_page_writes=off
+
+  # ---- Pgman proxy ------------------------------------------------
+  pgman:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Every port is bound to 127.0.0.1 on purpose. This stack runs with
+    # trust auth (see config.docker.yaml), so an unqualified "6435:6435"
+    # would publish an unauthenticated Postgres proxy — and the admin SQL
+    # interface behind it — on every interface of the host.
+    ports:
+      - "127.0.0.1:6435:6435"   # Postgres wire
+      - "127.0.0.1:8080:8080"   # Prometheus /metrics
+      - "127.0.0.1:8081:8081"   # Admin UI
+    volumes:
+      - ./config.docker.yaml:/etc/pgman/config.yaml:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,6 @@
+# .dockerignore — keep the build context lean.
+.git
+Dockerfile
+docker-compose.yaml
+.dockerignore
+*.md

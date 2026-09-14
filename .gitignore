@@ -1,0 +1,27 @@
+# Build output
+/pgman
+/dist/
+*.test
+*.out
+
+# Keys and certificates. Nothing under certs/ is ever committed —
+# generate a local pair with scripts/gen-dev-certs.sh instead.
+/certs/
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+
+# Local configuration overrides. config.yaml and config.docker.yaml are
+# tracked samples; anything else is assumed to hold real credentials.
+config.local.yaml
+*.local.yaml
+.env
+.env.*
+
+# Editor / OS noise
+.DS_Store
+.idea/
+*.swp

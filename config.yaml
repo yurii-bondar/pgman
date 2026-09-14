@@ -1,0 +1,139 @@
+# ============================================================================
+# pgman — production-ready sample config
+# ============================================================================
+# Every duration accepts Go's time.Duration syntax: "30s", "5m", "1h".
+# Unset (zero) values fall back to defaults from Config.applyDefaults —
+# only the values you actually want to override need to appear here.
+# ----------------------------------------------------------------------------
+
+# ---- Network / TLS ---------------------------------------------------------
+
+listen_addr: ":6435"                        # Postgres wire (data plane)
+metrics_addr: ":8080"                       # Prometheus /metrics only (public-safe)
+admin_addr: "127.0.0.1:8081"                # Admin UI + pool CRUD (loopback only unless auth is set below)
+
+# certs/ is gitignored and ships empty. For local development generate a
+# self-signed localhost pair with `scripts/gen-dev-certs.sh`; in
+# production point these at your real certificate and key.
+tls_cert_file: "certs/server.crt"
+tls_key_file: "certs/server.key"
+
+# ---- Client-facing auth (Postgres clients) ---------------------------------
+
+# Never a plaintext password — see `pgman -gen-scram-verifier <password>`,
+# or copy straight from `SELECT rolpassword FROM pg_authid` on a real Postgres.
+auth_users:
+  rgs: "SCRAM-SHA-256$4096:PDleUJSqWGThS77n6IaYiQ==$suBycl9o9+u6tHTq5XCcL9ZepPhAut3KA/Dtdi1wgOM=:zUnH1fzQ1MM7+8Lru2+voRbOK5s8OKumgunqoyfrq5E="
+
+# ---- Admin-facing auth (HTTP admin UI) -------------------------------------
+
+# Required whenever admin_addr is bound to a non-loopback interface.
+# Generate hash with: `pgman -gen-admin-password '<pwd>'`
+# admin_basic_auth_user: "admin"
+# admin_basic_auth_password_hash: "$2a$12$..."
+
+# ---- Admin TLS / mTLS -------------------------------------------------
+# Enabling admin_tls_cert_file+admin_tls_key_file switches the admin
+# listener to HTTPS. Adding admin_tls_client_ca_file additionally
+# enables mutual TLS: any client presenting a certificate signed by
+# the CA bundle bypasses Basic/OIDC and is authenticated by cert.
+# admin_mtls_allowed_cns is an optional CN allowlist — empty ⇒ any
+# cert issued by the CA is accepted.
+# admin_tls_cert_file: "/etc/pgman/admin.crt"
+# admin_tls_key_file:  "/etc/pgman/admin.key"
+# admin_tls_client_ca_file: "/etc/pgman/ops-ca.crt"
+# admin_mtls_allowed_cns:
+#   - "ops-alice"
+#   - "ops-bob"
+
+# ---- Admin OIDC (Bearer token) ---------------------------------------
+# Verifies id_tokens from the given OpenID Provider. At least one of
+# allowed_emails / allowed_subjects must be non-empty when OIDC is
+# enabled — otherwise anyone with a valid token from the issuer walks
+# in, which is never intended.
+# admin_oidc_issuer_url: "https://accounts.google.com"
+# admin_oidc_client_id:  "pgman-admin.apps.googleusercontent.com"
+# admin_oidc_allowed_emails:
+#   - "alice@example.com"
+# admin_oidc_allowed_subjects: []
+# admin_oidc_skip_email_verified: false      # keep false unless IDP omits the claim
+
+# enable_pprof: true                        # net/http/pprof under admin auth
+
+# ---- Data-plane limits & timeouts ------------------------------------------
+
+max_client_conn: 10000                      # cap on concurrent client conns (0 = unlimited — unsafe)
+client_login_timeout: "60s"                 # startup+auth deadline; defends against slowloris
+query_wait_timeout: "120s"                  # max Acquire wait on saturated pool
+server_reset_query: "DISCARD ALL"           # session-state scrub between clients
+tcp_keepalive: "30s"                        # detect vanished peers instead of leaking FDs
+
+# The three session timeouts. All default to 0 (disabled), matching
+# PgBouncer and Postgres — enabling them is a workload decision, and the
+# values below are a starting point, not a recommendation.
+#
+# Leaving all three at 0 means a hung peer is bounded only by TCP
+# keepalive, i.e. by the OS, i.e. potentially for hours.
+query_timeout: "60s"                        # max time one statement may run; 0 = unlimited.
+                                            #   Does NOT apply to COPY or replication streams.
+                                            #   Raise it if you run long reports through the proxy.
+client_idle_timeout: "30m"                  # close a client that is connected but silent outside a transaction
+idle_transaction_timeout: "5m"              # close a client idle *inside* an open transaction.
+                                            #   The dangerous one: such a client pins a backend
+                                            #   AND holds its locks and snapshot.
+
+# ---- Backend failure handling ----------------------------------------------
+
+# After this many consecutive dial failures the pool stops trying and
+# fails fast, until the cooldown elapses and one probe is let through.
+# Clients get a retryable error (SQLSTATE 08006), not a dropped
+# connection. Enabled by default; set threshold to -1 to disable.
+circuit_breaker_threshold: 5
+circuit_breaker_cooldown: "5s"
+
+# ---- Pool lifecycle defaults (override per-pool below) ---------------------
+
+server_idle_timeout: "10m"                  # close pooled conn if idle longer
+server_lifetime: "1h"                       # close pooled conn if older, enables silent credential rotation
+server_check_delay: "30s"                   # skip healthcheck for fresh idle conns
+server_login_retry: 3                       # extra dial attempts on failure
+server_login_backoff: "200ms"               # initial dial-retry backoff
+min_pool_size: 0                            # warm-up target per pool
+health_check_timeout: "500ms"
+
+# ---- HTTP server timeouts (metrics + admin listeners) ----------------------
+
+http_read_header_timeout: "5s"
+http_read_timeout: "30s"
+# http_write_timeout intentionally omitted — admin serves SSE (long-lived);
+# override it if you split /metrics onto its own restrictive listener.
+http_idle_timeout: "60s"
+
+# ---- Logging ---------------------------------------------------------------
+
+log_format: "json"                          # "json" for production, "text" for dev
+log_level: "info"                           # debug/info/warn/error
+
+# ---- Pools -----------------------------------------------------------------
+
+# Refuse to start a pool whose DSN does not mandate TLS. Without this,
+# a typo in sslmode silently downgrades proxy→Postgres traffic — and
+# credentials — to plain text, and nothing tells you.
+require_backend_tls: true
+
+pools:
+  backoffice:
+    # Never commit a real password here. Keep this file free of secrets
+    # and inject the DSN from your secret store / environment at deploy
+    # time; the placeholders below exist to be replaced.
+    backend_dsn: "postgres://REPLACE_USER:REPLACE_PASSWORD@localhost:5432/backoffice?sslmode=verify-full"
+    backend_addr: "localhost:5432"
+    limit: 20
+    min_idle: 2                             # keep 2 conns warm at all times
+    # idle_timeout, max_lifetime, etc. inherit top-level defaults unless set here
+
+  game_rgs:
+    backend_dsn: "postgres://REPLACE_USER:REPLACE_PASSWORD@localhost:5433/game_rgs?sslmode=verify-full"
+    backend_addr: "localhost:5433"
+    limit: 20
+    min_idle: 2

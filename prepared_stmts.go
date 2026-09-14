@@ -1,0 +1,337 @@
+// Package main — prepared statement support in transaction pooling.
+//
+// The problem: pgx / Java / other extended-protocol clients aggressively
+// Parse-then-Bind — the "prepared statement cache" is a client-side
+// optimization that assumes the same backend across many requests. In
+// transaction pooling that assumption breaks: after RFQ 'I' we release
+// the backend and the next transaction may land elsewhere. The client
+// tries Bind("stmtcache_0001", …) on a fresh backend that has never
+// seen that Parse → "prepared statement does not exist".
+//
+// The fix (matches PgBouncer 1.21+):
+//
+//  1. Track per-client every Parse we relay: (client_name → sql + OIDs).
+//  2. Track per-backend which of those statements it has actually
+//     received a Parse for (backend.preparedStmts set).
+//  3. Before forwarding a Bind/Describe/Close for statement S:
+//     - If the current backend already has S: forward unchanged.
+//     - Otherwise: prepend a Parse for S using the saved sql+OIDs,
+//     mark the backend as knowing S, then forward the client's msg.
+//  4. Swallow the ParseComplete produced by any prepended Parse so the
+//     client's response stream contains exactly what the client asked
+//     for — no phantom ParseCompletes it never issued a Parse for.
+//  5. On client Close(S): drop from the session cache. Don't bother
+//     forwarding a Close to the backend — the backend still holds S,
+//     and DISCARD ALL between-txn Release cleans it up anyway.
+//
+// The whole surface only kicks in for NAMED prepared statements
+// (Parse.Name != ""). Unnamed (Name = "") are single-Bind ephemerals —
+// no risk of them being reused across backends.
+package main
+
+import (
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgproto3"
+)
+
+// prepStmtInfo is what the proxy needs to replay a Parse on any
+// backend that hasn't seen a given prepared statement yet.
+type prepStmtInfo struct {
+	SQL           string
+	ParameterOIDs []uint32
+}
+
+// psCache is the per-session prepared statement registry — keyed by
+// client-chosen name (e.g. "stmtcache_0001"). Grows on Parse, shrinks
+// on Close.
+type psCache map[string]*prepStmtInfo
+
+// backendPSCache tracks which statement names the current backend has
+// actually seen a Parse for. Attached to backendConn so that when the
+// backend is released and later re-Acquired by a different session,
+// the cache is preserved (safe: DISCARD ALL between transactions
+// closes prepared statements, so we also need to clear this on Release
+// — see clearBackendPSCache).
+type backendPSCache map[string]struct{}
+
+// processClientMsg is the fused fast-path called before forwarding
+// each client message. It runs three independent checks in ONE type
+// switch (formerly three separate calls with three type switches):
+//
+//  1. Prepared-statement lazy replay (Parse/Bind/Describe/Close)
+//  2. LISTEN/NOTIFY footgun warn (Query/Parse carrying LISTEN)
+//  3. DDL cache invalidation (Query/Parse carrying DDL)
+//
+// Fast bail-out: if the message isn't one of the interesting types
+// (Sync, Execute, Flush, CopyData, …) it returns immediately with
+// zero work — the hottest steady-state message flow is Bind → Execute
+// → Sync repeated forever, and only Bind carries real work here.
+//
+// Return values: (msg unchanged so caller can forward it as-is,
+// swallowParseComplete count as in the old interceptClientMsg).
+func processClientMsg(
+	fe *pgproto3.Frontend,
+	backend *backendConn,
+	sess *session,
+	msg pgproto3.FrontendMessage,
+) (pgproto3.FrontendMessage, int) {
+	// Single type switch covers everything.
+	switch m := msg.(type) {
+	case *pgproto3.Parse:
+		// PS tracking (unconditional — this is the only path that
+		// populates sess.psCache) + DDL/LISTEN checks on the query text.
+		if m.Name != "" {
+			trackClientParse(backend, sess, m)
+		}
+		checkSQLSideEffects(backend, sess, m.Query)
+		return msg, 0
+	case *pgproto3.Bind:
+		return ensureBackendHasStmt(fe, backend, sess, m.PreparedStatement, msg)
+	case *pgproto3.Describe:
+		if m.ObjectType == 'S' {
+			return ensureBackendHasStmt(fe, backend, sess, m.Name, msg)
+		}
+		return msg, 0
+	case *pgproto3.Close:
+		if m.ObjectType == 'S' && m.Name != "" {
+			if sess.psCache != nil {
+				delete(sess.psCache, m.Name)
+			}
+			if backend != nil && backend.preparedStmts != nil {
+				delete(backend.preparedStmts, m.Name)
+			}
+		}
+		return msg, 0
+	case *pgproto3.Query:
+		// Simple protocol carries SQL directly. Only path where
+		// LISTEN warn / DDL flush can trigger.
+		checkSQLSideEffects(backend, sess, m.String)
+		return msg, 0
+	}
+	// Sync, Execute, Flush, CopyData, CopyDone, CopyFail, Terminate:
+	// nothing to inspect. This is the branch the hot Bind/Execute/Sync
+	// loop hits 2 out of 3 messages — kept as a tight tail return.
+	return msg, 0
+}
+
+// trackClientParse populates the session/backend caches when a client
+// issues a named Parse. Split from processClientMsg so the *pgproto3.Parse
+// branch there stays tight.
+func trackClientParse(backend *backendConn, sess *session, m *pgproto3.Parse) {
+	if sess.psCache == nil {
+		sess.psCache = make(psCache)
+	}
+	sess.psCache[m.Name] = &prepStmtInfo{
+		SQL:           m.Query,
+		ParameterOIDs: append([]uint32(nil), m.ParameterOIDs...),
+	}
+	if backend != nil {
+		if backend.preparedStmts == nil {
+			backend.preparedStmts = make(backendPSCache)
+		}
+		backend.preparedStmts[m.Name] = struct{}{}
+	}
+}
+
+// checkSQLSideEffects runs the two SQL-text-driven side-effect checks
+// (LISTEN warn, DDL cache flush) in a single pass. Extracted so both
+// the Query and Parse cases in processClientMsg share the same code.
+// Empty sql short-circuits with no work.
+func checkSQLSideEffects(backend *backendConn, sess *session, sql string) {
+	if sql == "" {
+		return
+	}
+	if !sess.listenWarned {
+		checkListenWarn(sess, sql)
+	}
+	if isDDL(sql) {
+		invalidatePSCachesOnDDL(backend, sess)
+	}
+}
+
+// interceptClientMsg is retained as a legacy shim so any callers not
+// yet migrated keep working. New code should use processClientMsg.
+//
+// Deprecated: use processClientMsg.
+func interceptClientMsg(
+	fe *pgproto3.Frontend,
+	backend *backendConn,
+	sess *session,
+	msg pgproto3.FrontendMessage,
+) (out pgproto3.FrontendMessage, swallowParseComplete int) {
+	switch m := msg.(type) {
+	case *pgproto3.Parse:
+		if m.Name == "" {
+			return msg, 0 // unnamed — no reuse, no caching
+		}
+		if sess.psCache == nil {
+			sess.psCache = make(psCache)
+		}
+		// Client is Parsing — record so we can replay later if this
+		// same statement is Bound on a different backend.
+		sess.psCache[m.Name] = &prepStmtInfo{
+			SQL:           m.Query,
+			ParameterOIDs: append([]uint32(nil), m.ParameterOIDs...),
+		}
+		// Mark the current backend as having it — the Parse we're
+		// about to forward IS the preparation. Optimistic; if the
+		// backend errors on Parse, the backend gets discarded anyway.
+		if backend != nil {
+			if backend.preparedStmts == nil {
+				backend.preparedStmts = make(backendPSCache)
+			}
+			backend.preparedStmts[m.Name] = struct{}{}
+		}
+		return msg, 0
+
+	case *pgproto3.Bind:
+		return ensureBackendHasStmt(fe, backend, sess, m.PreparedStatement, msg)
+
+	case *pgproto3.Describe:
+		// Target 'S' = describe by statement name. 'P' = by portal
+		// (portals are short-lived, don't need replay).
+		if m.ObjectType == 'S' {
+			return ensureBackendHasStmt(fe, backend, sess, m.Name, msg)
+		}
+		return msg, 0
+
+	case *pgproto3.Close:
+		if m.ObjectType == 'S' && m.Name != "" {
+			// Client is done with this stmt. Forget it from the
+			// session cache so we don't waste memory. We don't drop
+			// it from backend.preparedStmts because the client's
+			// Close will make backend forget it too (which then
+			// races on next Release+DISCARD ALL — either way, we're
+			// clean-slating this backend re: this stmt).
+			if sess.psCache != nil {
+				delete(sess.psCache, m.Name)
+			}
+			if backend != nil && backend.preparedStmts != nil {
+				delete(backend.preparedStmts, m.Name)
+			}
+		}
+		return msg, 0
+	}
+	return msg, 0
+}
+
+// ensureBackendHasStmt is the core of the transaction-pool prepared-
+// statement trick: if the backend hasn't been shown this statement
+// yet, prepend a Parse before forwarding the client's message.
+func ensureBackendHasStmt(
+	fe *pgproto3.Frontend,
+	backend *backendConn,
+	sess *session,
+	stmtName string,
+	msg pgproto3.FrontendMessage,
+) (pgproto3.FrontendMessage, int) {
+	if stmtName == "" {
+		return msg, 0 // unnamed / referring to a portal — nothing to prep
+	}
+	if sess.psCache == nil {
+		return msg, 0
+	}
+	info, ok := sess.psCache[stmtName]
+	if !ok {
+		return msg, 0 // we've never seen a Parse for this name — client bug or backend-side stmt
+	}
+	if backend == nil {
+		return msg, 0
+	}
+	if backend.preparedStmts == nil {
+		backend.preparedStmts = make(backendPSCache)
+	}
+	if _, has := backend.preparedStmts[stmtName]; has {
+		return msg, 0 // backend already has it — no prepend needed
+	}
+	// Prepend the Parse — same name as client-chosen so the client's
+	// Bind/Describe/Close forwarded right after references the same
+	// name on the backend side too.
+	fe.Send(&pgproto3.Parse{
+		Name:          stmtName,
+		Query:         info.SQL,
+		ParameterOIDs: info.ParameterOIDs,
+	})
+	backend.preparedStmts[stmtName] = struct{}{}
+	return msg, 1
+}
+
+// isDDL returns true when the SQL text looks like a schema-mutating
+// statement (CREATE / ALTER / DROP / TRUNCATE / GRANT / REVOKE /
+// COMMENT / REINDEX / VACUUM FULL etc). Cheap prefix match on the
+// first keyword — false positives here just cause an extra
+// prepared-statement cache flush (harmless), and false negatives cost
+// nothing worse than what already happens today.
+//
+// Callers use this to invalidate cached prepared statements whose
+// plans may reference the affected relation. Postgres will otherwise
+// raise "cached plan must not change result type" on the next Execute.
+func isDDL(sql string) bool {
+	// Skip leading whitespace / opening paren / comments starting with
+	// -- (block comments /* */ are handled by a client bug — we don't
+	// unwrap them; the DDL keyword is still in the tail so misdetection
+	// is only-way-forward = false negative, safe).
+	s := strings.TrimLeft(sql, " \t\r\n")
+	for strings.HasPrefix(s, "--") {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = strings.TrimLeft(s[i+1:], " \t\r\n")
+		} else {
+			return false
+		}
+	}
+	if len(s) < 5 {
+		return false
+	}
+	// Only look at the first keyword. Uppercase compare.
+	end := 0
+	for end < len(s) {
+		c := s[end]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+			break
+		}
+		end++
+	}
+	head := strings.ToUpper(s[:end])
+	switch head {
+	case "CREATE", "ALTER", "DROP", "TRUNCATE",
+		"GRANT", "REVOKE", "COMMENT", "REINDEX",
+		"REFRESH", "CLUSTER", "SECURITY":
+		return true
+	case "VACUUM":
+		// VACUUM (FULL) rewrites tables and invalidates cached plans.
+		// Plain VACUUM is safer but flushing anyway is cheap — do it.
+		return true
+	}
+	return false
+}
+
+// invalidatePSCachesOnDDL is called right after we forward a DDL to
+// the backend. Clears the session-side cache so any subsequent Bind
+// (which would have referenced the OLD prepared statement name) is
+// treated as a fresh reference — client re-issues Parse, backend plans
+// against post-DDL schema. Also clears the current backend's cache so
+// the very next Bind IN THIS SAME TX gets a fresh Parse prepended.
+//
+// Backends not currently held by this session aren't touched — they
+// still hold stale prepared statements. That's fine: Postgres itself
+// raises "cached plan must not change result type" on the next
+// Execute against them, and pgx/libpq handles that by re-preparing.
+func invalidatePSCachesOnDDL(backend *backendConn, sess *session) {
+	if sess != nil {
+		sess.psCache = nil
+	}
+	clearBackendPSCache(backend)
+}
+
+// clearBackendPSCache is called right after a serverResetQuery runs
+// ("DISCARD ALL" wipes all prepared statements on the backend), so the
+// cache no longer reflects reality. Skipping this would leave stale
+// entries saying "backend knows S" when it doesn't, causing the very
+// "does not exist" errors this whole machinery exists to avoid.
+func clearBackendPSCache(b *backendConn) {
+	if b == nil {
+		return
+	}
+	b.preparedStmts = nil
+}
