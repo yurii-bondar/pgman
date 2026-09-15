@@ -96,10 +96,47 @@ exists. The settings worth knowing up front:
 | `shutdown_timeout` | Drain budget on `SIGTERM`. | `30s` |
 | `pools.<name>.pool_mode` | `transaction`, `session` or `statement`. | `transaction` |
 | `pools.<name>.limit` | Backend connections for this pool. | — |
+| `pools.<name>.backend_users` | Per-role backend DSNs; each gets its own pool. | — |
 
 Each pool is defined under `pools:` with its own backend DSN and limit,
 and may expose `aliases` so several client-facing database names share
 one pool.
+
+### Backend identity
+
+By default every client reaches Postgres as the `backend_dsn` role,
+whatever role it authenticated as. That is PgBouncer's forced-user mode
+(`user=` on a database) and it has the same consequence: `GRANT` and
+`REVOKE` no longer distinguish your clients, row-level security sees a
+single identity, and `pg_stat_activity` attributes every statement to
+the same role.
+
+`backend_users` gives individual roles their own backend credentials:
+
+```yaml
+pools:
+  backoffice:
+    backend_dsn: "postgres://app_ro@db:5432/backoffice?sslmode=verify-full"
+    backend_addr: "db:5432"
+    limit: 20
+    backend_users:
+      alice: "postgres://alice@db:5432/backoffice?sslmode=verify-full&passfile=/etc/pgman/pgpass"
+```
+
+A full DSN rather than a password, so the secret need not live in the
+config at all — point it at a `.pgpass` with `passfile=`, or use
+certificate auth with `sslcert=`/`sslkey=`.
+
+Pools are keyed by the identity they dial with, so a listed user gets
+its own pool — shown as `backoffice/alice` in metrics, `SHOW POOLS` and
+the admin UI — while everyone else keeps sharing the `backend_dsn` one.
+That is what PgBouncer does too: a pool per (database, user), collapsing
+to one per database when the definition forces a single user. Size for
+it: one pool per listed user, each up to `limit` connections.
+
+Users resolved through `auth_query` are not covered — per-user backend
+identity needs per-user backend credentials, and those have to be
+configured.
 
 ### Pool modes and what they cost you
 
@@ -246,6 +283,12 @@ Honest list, so nobody discovers these in an incident:
   away with session state until load starts moving connections between
   clients. Isolation between different clients is unaffected either
   way. Off by default; see above for what it buys.
+- **Per-user backend identity has to be configured.** `backend_users`
+  needs a DSN per role, so users resolved dynamically through
+  `auth_query` still share the `backend_dsn` identity. SCRAM
+  pass-through — reusing the client's own proof to authenticate to
+  Postgres, as PgBouncer does — would remove that requirement but needs
+  a backend connector of our own instead of `pgconn`.
 - **`SIGHUP` does not resize or re-target existing pools** — only adds
   and removes them. Changing a limit, DSN or TLS setting needs a restart.
 - **No online restart (`-R`).** This is deliberate; see `DEV_PLAN.md`

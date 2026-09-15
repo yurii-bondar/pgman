@@ -166,6 +166,23 @@ pools:
     backend_addr: "localhost:5432"
     limit: 20
     min_idle: 2                             # keep 2 conns warm at all times
+
+    # Give individual roles their own backend credentials, so a client
+    # authenticated as alice also runs as alice on Postgres. Without this
+    # every client shares the backend_dsn role whatever it logged in as,
+    # and GRANT/REVOKE, row-level security and pg_stat_activity all stop
+    # telling your clients apart.
+    #
+    # Pools are keyed by the identity they dial with: users listed here
+    # each get their own pool (visible as "backoffice/alice" in metrics
+    # and SHOW POOLS), everyone else keeps sharing the backend_dsn one.
+    # Budget a pool per listed user, each up to `limit` connections.
+    #
+    # A full DSN, not a password, so the secret need not live in this
+    # file: use passfile= for a .pgpass, or sslcert=/sslkey= for
+    # certificate auth with no password at all.
+    # backend_users:
+    #   alice: "postgres://alice@localhost:5432/backoffice?sslmode=verify-full&passfile=/etc/pgman/pgpass"
     # idle_timeout, max_lifetime, etc. inherit top-level defaults unless set here
 
   game_rgs:

@@ -365,6 +365,28 @@ type PoolConfig struct {
 	BackendDSN  string `yaml:"backend_dsn"`
 	BackendAddr string `yaml:"backend_addr"`
 	Limit       int    `yaml:"limit"`
+	// BackendUsers gives individual client roles their own backend
+	// credentials, so that a client authenticated as alice also runs as
+	// alice on Postgres. Keys are client usernames; values are complete
+	// DSNs, used in place of BackendDSN for that user's connections.
+	//
+	// Without this, every client shares BackendDSN's role no matter who
+	// they authenticated as, which is PgBouncer's forced-user mode
+	// (`user=` on a database) and has the same consequence: GRANT and
+	// REVOKE stop distinguishing your clients, row-level security sees
+	// one identity, and pg_stat_activity attributes every statement to
+	// the same role.
+	//
+	// A full DSN rather than a password so the credential need not sit
+	// in this file at all: point it at a .pgpass with `passfile=`, or
+	// use certificate auth with `sslcert=`/`sslkey=` and no password.
+	//
+	// Pools are keyed by the identity they actually use on the backend,
+	// so users listed here each get their own pool and everyone else
+	// keeps sharing the BackendDSN one. Budget for it: a pool per
+	// listed user, each up to Limit connections.
+	BackendUsers map[string]string `yaml:"backend_users"`
+
 	// Aliases are extra client-visible database names that route to
 	// this pool. The primary building block for r/w split (an "app_ro"
 	// alias on a replica pool sends read-only clients to replicas
@@ -628,6 +650,24 @@ func loadConfig(path string) (*Config, error) {
 		}
 		if pc.Limit <= 0 {
 			return nil, fmt.Errorf("%s: pool %q: limit must be positive, got %d", path, name, pc.Limit)
+		}
+		// Registry keys are "<pool>/<backend user>", so a slash in
+		// either half could make two different pools collide on one
+		// key — and a routing collision is a client reaching the wrong
+		// database. Cheap to forbid, impossible to debug if allowed.
+		if strings.Contains(name, poolKeySeparator) {
+			return nil, fmt.Errorf("%s: pool name %q must not contain %q", path, name, poolKeySeparator)
+		}
+		for user, dsn := range pc.BackendUsers {
+			if user == "" {
+				return nil, fmt.Errorf("%s: pool %q: backend_users has an empty username", path, name)
+			}
+			if strings.Contains(user, poolKeySeparator) {
+				return nil, fmt.Errorf("%s: pool %q: backend_users key %q must not contain %q", path, name, user, poolKeySeparator)
+			}
+			if dsn == "" {
+				return nil, fmt.Errorf("%s: pool %q: backend_users[%q] has an empty DSN", path, name, user)
+			}
 		}
 	}
 
