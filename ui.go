@@ -202,6 +202,15 @@ func drainInBackground(name string, p *pool.Pool) {
 	}
 }
 
+// drainPoolsInBackground drains every pool that a single registry name
+// had behind it. A pool split by backend_users has one per identity,
+// and all of them are replaced together by a resize or a remove.
+func drainPoolsInBackground(name string, pools []*pool.Pool) {
+	for _, p := range pools {
+		go drainInBackground(name, p)
+	}
+}
+
 func addPoolHandler(registry *PoolRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -245,7 +254,7 @@ func resizePoolHandler(registry *PoolRegistry) http.HandlerFunc {
 			renderManagePanel(w, r, registry, err.Error(), true)
 			return
 		}
-		go drainInBackground(name, old)
+		drainPoolsInBackground(name, old)
 		slog.Info("ui: pool resized", "pool", name, "limit", limit)
 		renderManagePanel(w, r, registry, fmt.Sprintf("pool %q resized to %d — old connections draining in background.", name, limit), false)
 	}
@@ -259,7 +268,7 @@ func removePoolHandler(registry *PoolRegistry) http.HandlerFunc {
 			renderManagePanel(w, r, registry, err.Error(), true)
 			return
 		}
-		go drainInBackground(name, old)
+		drainPoolsInBackground(name, old)
 		slog.Info("ui: pool removed", "pool", name)
 		renderManagePanel(w, r, registry, fmt.Sprintf("pool %q removed — active sessions draining in background.", name), false)
 	}

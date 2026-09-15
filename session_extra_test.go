@@ -48,7 +48,7 @@ func TestSendRealCancelRequestTimeoutOnUnreachable(t *testing.T) {
 	t.Cleanup(func() { cancelDialTimeout = orig })
 
 	start := time.Now()
-	err := sendRealCancelRequest("203.0.113.1:65432", 1, secretBytes(2))
+	err := sendRealCancelRequest("203.0.113.1:65432", 1, secretBytes(2), nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -83,7 +83,7 @@ func TestSendRealCancelRequestFast(t *testing.T) {
 		_, _ = conn.Read(buf) // discard whatever CancelRequest was sent
 	}()
 
-	if err := sendRealCancelRequest(ln.Addr().String(), 1, secretBytes(2)); err != nil {
+	if err := sendRealCancelRequest(ln.Addr().String(), 1, secretBytes(2), nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 

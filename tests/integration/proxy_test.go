@@ -63,6 +63,12 @@ func TestMultipleQueriesSameConn(t *testing.T) {
 
 // TestTransaction — BEGIN...COMMIT holds the same backend; DISCARD ALL
 // resets session state (application_name) after commit.
+//
+// This is also the canary for server_reset_query_skip_same_session: with
+// that option on, the pool hands this single client its own connection
+// back, the scrub is skipped and application_name survives. That is the
+// documented trade, so a failure here under that setting is expected and
+// not a regression.
 func TestTransaction(t *testing.T) {
 	inst := startProxy(t, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

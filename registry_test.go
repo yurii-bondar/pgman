@@ -38,8 +38,8 @@ func TestPoolRegistryAddGetRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if removed != p {
-		t.Error("Remove should return the exact pool that was registered")
+	if len(removed) != 1 || removed[0] != p {
+		t.Errorf("Remove should return the exact pool that was registered, got %d pool(s)", len(removed))
 	}
 	if _, ok := r.Get("db1"); ok {
 		t.Fatal("pool should be gone from the registry immediately after Remove")
@@ -88,8 +88,8 @@ func TestPoolRegistryResizeSwapsPoolAndPreservesOtherFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resize: %v", err)
 	}
-	if old != original {
-		t.Error("Resize should return the pool that was replaced")
+	if len(old) != 1 || old[0] != original {
+		t.Errorf("Resize should return the pool that was replaced, got %d pool(s)", len(old))
 	}
 
 	current, ok := r.Get("db1")
