@@ -273,7 +273,13 @@ func (a *SCRAMAuth) Authenticate(pg *pgproto3.Backend, conn net.Conn, startup *p
 	})
 
 	pg.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte(serverFinal)})
-	return pg.Flush()
+	if err := pg.Flush(); err != nil {
+		// Named like every other stage in this function. A client that
+		// disappears exactly here is indistinguishable from one that
+		// disappeared at any other send unless the error says which.
+		return fmt.Errorf("send sasl final: %w", err)
+	}
+	return nil
 }
 
 // captureClientKey recovers and stores the client's ClientKey. A

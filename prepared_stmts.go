@@ -248,6 +248,11 @@ func markBackendHasStmt(fe *pgproto3.Frontend, backend *backendConn, sess *sessi
 					fe.Send(&pgproto3.Close{ObjectType: 'S', Name: victim})
 					swallow.closeComplete++
 				}
+				// Counted per eviction, not once per session like the
+				// warning below: a rising rate is what says the cap is
+				// under what the workload uses, and every eviction costs
+				// the next Bind an extra Parse round trip.
+				sess.metrics.observePreparedStmtEviction(sess.poolName)
 				if !sess.psEvicted {
 					sess.psEvicted = true
 					slog.Info("prepared-statement cache full on a backend, closing least recently used",

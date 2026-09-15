@@ -12,10 +12,19 @@ Prometheus metrics and a live admin UI built into the same binary.
 
 ## Status
 
-Pre-1.0. The protocol handling, pooling and auth paths are covered by
-unit tests and by integration tests against a real Postgres, but pgman
-has not been run in production. Read [Known limitations](#known-limitations)
-before deploying it anywhere that matters.
+1.x. What the version promises is compatibility, not mileage: the config
+file, the `pgman_*` and `pgbouncer_*` metric names, the admin SQL
+commands and the HTTP admin endpoints are the public surface, and a
+breaking change to any of them bumps the major version. Releases are cut
+from the commit log, so the changelog is the record of what moved.
+
+What it does not promise is production experience — pgman has not been
+run at scale by anybody yet. The protocol handling, pooling and auth
+paths are covered by unit tests (93% of statements) and by integration
+tests against a real Postgres, and CI builds and health-checks the
+container image on every push; that is evidence, not a track record.
+Read [Known limitations](#known-limitations) before deploying it
+anywhere that matters, and start with a workload you can move back.
 
 ## Why this exists
 
@@ -85,6 +94,8 @@ docker compose up -d
 | `-config <path>` | Config file to load. Default `config.yaml`. |
 | `-gen-scram-verifier <password>` | Print a SCRAM-SHA-256 verifier for `auth_users`, then exit. |
 | `-gen-admin-password <password>` | Print a bcrypt hash for `admin_basic_auth_password_hash`, then exit. |
+| `-version` | Print the version, Go version and platform, then exit. Works without a config file. |
+| `-health-check` | Probe `/ready` on this instance's metrics port and exit 0 when ready. Used by the image's `HEALTHCHECK`. |
 
 ## Configuration
 
@@ -98,6 +109,7 @@ exists. The settings worth knowing up front:
 | `metrics_addr` | Prometheus `/metrics` listener. | `:8080` |
 | `admin_addr` | Admin UI and pool API. | `127.0.0.1:8081` |
 | `auth_users` | Map of user to SCRAM-SHA-256 verifier. | — |
+| `auth_hba_file` | Postgres-style host-based auth rules; first match wins. | — |
 | `allow_insecure_trust_auth` | Accept every client without a password. | `false` |
 | `max_client_conn` | Global cap on accepted client connections, shared across the TCP and Unix listeners. | `10000` |
 | `query_wait_timeout` | How long a client waits for a backend. | `120s` |
@@ -107,6 +119,7 @@ exists. The settings worth knowing up front:
 | `client_write_timeout` | Max time one write to a client may block. | `60s` |
 | `max_prepared_statements` | Named statements kept prepared per backend connection (LRU). | `200` |
 | `scram_passthrough_idle_timeout` | Close a pass-through pool unused for this long. | `30m` |
+| `cancel_dial_timeout` | Bound on the second connection opened to deliver a CancelRequest. | `5s` |
 | `circuit_breaker_threshold` | Consecutive dial failures before failing fast. | `5` |
 | `circuit_breaker_cooldown` | How long the breaker stays open. | `5s` |
 | `require_backend_tls` | Refuse pools whose DSN does not mandate TLS. | `false` |
@@ -204,6 +217,37 @@ otherwise it holds only verifiers, which authenticate nowhere. That is
 still the better half of the bargain against a per-user password or
 passfile on disk — but it is a real change, which is why it is opt-in.
 
+### Host-based authentication
+
+`auth_hba_file` points at a file in Postgres/PgBouncer `pg_hba.conf`
+format. When set, every client is matched against its rules in order and
+the first match decides how — or whether — it authenticates:
+
+```
+# TYPE     DATABASE  USER   ADDRESS      METHOD
+local      all       all    -            peer
+hostssl    shop      alice  10.0.0.0/8   scram-sha-256
+hostssl    all       all    samehost     cert
+host       all       all    all          reject
+```
+
+`TYPE` is `host`, `hostssl`, `hostnossl` or `local` (Unix socket only).
+`METHOD` is `trust`, `reject`, `scram-sha-256`, `peer` — SO_PEERCRED
+identity on a Unix socket, so no password crosses anything, Linux only —
+or `cert`, which requires mutual TLS and the client certificate's Common
+Name to equal the requested user.
+
+`DATABASE` and `USER` take a name, a comma-separated list, or the keyword
+`all`. Keywords are matched case-insensitively, and double-quoting a
+value suppresses its keyword meaning: `"all"` is a database or role
+literally called `all`. A connection matching no rule is denied, so a
+trailing `reject all` changes nothing — but it does put the intent in the
+file where the next reader will see it.
+
+Per-method options (`clientcert=verify-full` and the rest of Postgres's
+sixth field) are not supported, and a line carrying one is refused rather
+than accepted and ignored.
+
 ### Pool modes and what they cost you
 
 | Mode | Backend held for | Breaks |
@@ -234,6 +278,11 @@ process collectors:
 | `pgman_client_conn_active`, `pgman_client_conn_total` | Gauge / Counter |
 | `pgman_client_login_ok_total`, `pgman_client_login_failures_total` | Counter |
 | `pgman_max_client_conn_rejected_total` | Counter |
+| `pgman_build_info` | Gauge — always 1, `version` and `go_version` in labels |
+| `pgman_prepared_stmt_evictions_total` | Counter, per pool |
+| `pgman_passthrough_pools_evicted_total` | Counter |
+| `pgman_config_reloads_total` | Counter, by `result` |
+| `pgman_config_reload_pools_total` | Counter, by `action` |
 
 A subset is also published under `pgbouncer_*` names so existing
 PgBouncer dashboards keep working.
@@ -295,6 +344,14 @@ config-reload preview.
 
 It binds to loopback by default. Binding it anywhere else requires
 configuring authentication — HTTP Basic (bcrypt), OIDC, or mutual TLS.
+
+Everything it needs is inside the binary: htmx and its SSE extension are
+compiled in and served from `/static/`, behind the same authentication as
+the rest of the listener. No CDN, so the dashboard works in a network
+with no egress — which is where a database proxy usually lives — and
+nobody outside the process can change the JavaScript running on a page
+that can pause pools and cancel sessions. Upstream versions and their
+hashes are recorded in `web/static/PROVENANCE.md`.
 
 The dashboard is four tabs. Three of them — live status, sessions and
 recent errors — are server-rendered fragments pushed over the `/events`
@@ -372,6 +429,48 @@ livenessProbe:
 | `SIGHUP` | Reload the config file: add pools that appeared, drain pools that disappeared, and rebuild pools whose settings changed. Listener, TLS and auth wiring still need a restart. |
 | `SIGTERM` / `SIGINT` | Graceful drain: stop accepting connections, let in-flight transactions finish, close sessions that are between transactions with `57P01`, then exit. Bounded by `shutdown_timeout`. |
 
+### Running the container
+
+The image ships no configuration: `/etc/pgman/config.yaml` has to be
+mounted, and the process exits with a readable error if it is not.
+Nothing else is written to the filesystem unless `audit_log_path` names a
+file, so the root filesystem can be read-only.
+
+```yaml
+services:
+  pgman:
+    image: bondevn/pgman:1
+    read_only: true
+    volumes:
+      - ./config.yaml:/etc/pgman/config.yaml:ro
+      - ./certs:/etc/pgman/certs:ro
+    ports:
+      - "6435:6435"   # Postgres wire
+      - "8080:8080"   # /metrics, /health, /ready
+    # The admin UI stays on loopback unless authentication is configured;
+    # publishing 8081 without it is refused at the listener.
+    stop_grace_period: 45s
+```
+
+Two settings have to agree, and nothing enforces it: the orchestrator's
+grace period must exceed `shutdown_timeout` (30s by default). Docker
+sends `SIGTERM`, waits its grace period and then sends `SIGKILL` — if that
+happens first, the drain is cut off mid-transaction, which is the outcome
+the drain exists to avoid. In Kubernetes the same pairing is
+`terminationGracePeriodSeconds`.
+
+The image declares a `HEALTHCHECK` that runs `pgman -health-check`: the
+binary probes `/ready` on its own metrics port and exits 0 or 1. It is
+written that way because a distroless image has no shell, curl or wget to
+write a health check with, and adding one would put a package manager's
+worth of attack surface next to a process that terminates database
+credentials. Since it follows readiness, a container draining on
+`SIGTERM` reports unhealthy — which is what stops Compose or Swarm from
+sending it new work. Kubernetes ignores it and uses the probes above.
+
+Images are published for `linux/amd64` and `linux/arm64`, run as
+`nonroot` (UID 65534) on distroless, and are around 27 MB.
+
 ## Known limitations
 
 Honest list, so nobody discovers these in an incident:
@@ -418,13 +517,16 @@ Honest list, so nobody discovers these in an incident:
   Service, and the graceful drain on `SIGTERM`. Handing listen file
   descriptors between two processes buys nothing there, and the
   coordination is the expensive part.
-- **`SHOW POOLS` reports `cl_active` as `0`** — per-database client
-  counts are not tracked yet. The `pgman_client_conn_active` metric and
-  the admin UI's session list both have the real numbers.
+- **A connection returned to the wrong pool is refused, not absorbed.**
+  `Release` and `Discard` identify a connection by the record the pool
+  made when it dialed it, so returning one it never issued — or the same
+  one twice — closes nothing it should not and leaves the accounting
+  alone. It is reported in the event log as `foreign_release`,
+  `double_release` or `slot_underflow`; all three mean a caller bug.
 - **No release binaries** — container images only; build from source if
-  you need a bare binary. `SHOW VERSION` also still reports a hardcoded
-  string; the release version a container is running is in its startup
-  log line, not in admin SQL.
+  you need a bare binary. A source build reports its version as `dev`,
+  since the release number is stamped in by the release workflow rather
+  than derived from the tree.
 
 ## Development
 
@@ -433,6 +535,28 @@ go build ./...
 go vet ./...
 go test -race ./...          # unit tests
 golangci-lint run            # see .golangci.yml
+```
+
+The unit tests need no Postgres: `fakepg_test.go` implements enough of
+the wire protocol — startup, SCRAM, TLS upgrade, both query protocols —
+to be dialed over TCP, and `run_test.go` brings the whole proxy up on
+ephemeral ports against it. A test that wants to watch a real client
+through a real pool does not have to mock anything to do it:
+
+```sh
+go test -run TestRunServesAQueryEndToEnd -v ./...
+```
+
+CI enforces a coverage floor (`scripts/coverage-gate.sh`, currently 90%)
+on top of the summary, because the question coverage answers that review
+cannot is whether new code is exercised by anything at all. It is a
+floor, not a target — if a branch genuinely cannot be reached from a
+test, say so where it lives and lower the floor in the same commit.
+
+```sh
+go test -race -coverprofile=coverage.out ./...
+scripts/coverage-gate.sh coverage.out 90
+go tool cover -html=coverage.out      # what is left, and where
 ```
 
 Integration tests live in `tests/integration` as a separate module and
@@ -491,9 +615,17 @@ outside this repository:
   `@semantic-release/git` plugin from `.releaserc.json` and let the tag
   and the release notes be the record.
 
-The version is stamped into the binary at link time and appears in the
-`pgman up` log line, so a running container can be identified without
-guessing which digest it came from.
+The version is stamped into the binary at link time, so a running
+container can be identified three ways without mapping a digest back to
+a tag by hand: `pgman -version`, the `pgman up` log line, `SHOW VERSION`
+on the admin console, and the `pgman_build_info` metric.
+
+Dependency updates arrive as pull requests (`.github/dependabot.yml`):
+actions as one grouped `ci:` PR, Go modules and base images as `fix:`,
+which means a merged dependency bump cuts a patch release and republishes
+the image. The one thing dependabot cannot see is the pinned
+semantic-release version inside `release.yml`, since there is no
+`package.json` for it to read — that one is a manual bump.
 
 ## License
 

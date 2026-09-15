@@ -95,7 +95,13 @@ func handleAdminQuery(pg *pgproto3.Backend, registry *PoolRegistry, sql string) 
 	case upper == "SHOW DATABASES":
 		sendShowDatabases(pg, registry)
 	case upper == "SHOW VERSION":
-		sendSingleColumnRow(pg, "version", []string{"pgman 1.0 (PgBouncer-compatible admin)"}, "SHOW")
+		// The build's own version, not a literal. An operator running
+		// this during an incident is asking what is deployed, and the
+		// previous answer ("pgman 1.0") was the same on every build ever
+		// made — including the ones from before the feature they are
+		// looking for existed.
+		sendSingleColumnRow(pg, "version",
+			[]string{fmt.Sprintf("pgman %s (PgBouncer-compatible admin)", version)}, "SHOW")
 	case upper == "SHOW LISTS":
 		sendShowLists(pg, registry)
 	case strings.HasPrefix(upper, "PAUSE"):
@@ -208,6 +214,11 @@ func sendShowPools(pg *pgproto3.Backend, registry *PoolRegistry) {
 	cols := []string{"database", "cl_active", "cl_waiting", "sv_active", "sv_idle", "maxwait", "pool_mode", "paused"}
 	sendRowDescription(pg, cols)
 
+	// One snapshot for the whole table rather than a walk of the session
+	// shards per row: a proxy at max_client_conn has thousands of
+	// sessions, and SHOW POOLS is something operators run in a loop.
+	clients := sessionsByPool()
+
 	for _, name := range registry.Names() {
 		p, _ := registry.Get(name)
 		s := p.Stats()
@@ -223,7 +234,7 @@ func sendShowPools(pg *pgproto3.Backend, registry *PoolRegistry) {
 		cfg, _ := registry.PoolConfig(name)
 		row := [][]byte{
 			[]byte(name),
-			itoa(0), // cl_active — we don't track per-DB client counts yet
+			itoa(clients[name]),
 			itoa(s.Waiting),
 			itoa(s.InUse),
 			itoa(s.Idle),

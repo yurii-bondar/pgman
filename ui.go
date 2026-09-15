@@ -24,6 +24,27 @@ import (
 // visible result, and it can't touch the hot Acquire/Release path either way.
 const sseInterval = 500 * time.Millisecond
 
+// staticMaxAge is how long a browser may reuse the embedded JavaScript
+// without asking again. Deliberately short: the filenames carry no
+// content hash, so a long max-age would leave a stale htmx cached across
+// an upgrade with no way to bust it short of a different URL.
+const staticMaxAge = 5 * time.Minute
+
+// staticHandler serves the admin UI's JavaScript out of the binary.
+//
+// It is registered on the admin listener, behind the same authentication
+// as everything else there: the pages that load these files are already
+// authenticated, and an unauthenticated static route would be one more
+// surface answering requests on a listener whose whole point is that it
+// answers to nobody but operators.
+func staticHandler() http.Handler {
+	files := http.FileServerFS(web.Static)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", int(staticMaxAge.Seconds())))
+		files.ServeHTTP(w, r)
+	})
+}
+
 // poolDrainTimeout bounds how long a resize/remove waits for a pool's
 // in-flight connections to finish naturally before giving up and just
 // logging it — the registry mutation itself (what routing and the stats

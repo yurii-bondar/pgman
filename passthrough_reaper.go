@@ -53,7 +53,7 @@ func passthroughReapInterval(idleFor time.Duration) time.Duration {
 // returned function is called. A non-positive idleFor starts nothing
 // and returns a no-op, so "keep every pool forever" stays available as
 // an explicit choice.
-func startPassthroughReaper(registry *PoolRegistry, idleFor time.Duration) func() {
+func startPassthroughReaper(registry *PoolRegistry, idleFor time.Duration, metrics *proxyMetrics) func() {
 	if idleFor <= 0 {
 		return func() {}
 	}
@@ -66,7 +66,7 @@ func startPassthroughReaper(registry *PoolRegistry, idleFor time.Duration) func(
 			case <-stop:
 				return
 			case <-ticker.C:
-				reapPassthroughPools(registry, idleFor)
+				reapPassthroughPools(registry, idleFor, metrics)
 			}
 		}
 	}()
@@ -75,8 +75,9 @@ func startPassthroughReaper(registry *PoolRegistry, idleFor time.Duration) func(
 
 // reapPassthroughPools is one sweep, factored out so a test can run it
 // directly instead of waiting for a ticker.
-func reapPassthroughPools(registry *PoolRegistry, idleFor time.Duration) {
+func reapPassthroughPools(registry *PoolRegistry, idleFor time.Duration, metrics *proxyMetrics) {
 	keys, pools := registry.EvictIdlePassthrough(idleFor, activeSessionPoolKeys())
+	metrics.observePassthroughEvictions(len(keys))
 	for i, key := range keys {
 		// Drained in the background like every other displaced pool.
 		// The eviction conditions mean there is nothing in flight to

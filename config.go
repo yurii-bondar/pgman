@@ -40,6 +40,13 @@ const (
 	// a peer that has stopped reading altogether.
 	defaultClientWriteTimeout = 60 * time.Second
 
+	// defaultCancelDialTimeout matches the value this used to be
+	// hardcoded to. Short on purpose: a cancel that has not been
+	// delivered in five seconds has been overtaken by events — either
+	// the query finished on its own or the backend is in no state to
+	// act on it.
+	defaultCancelDialTimeout = 5 * time.Second
+
 	// defaultScramPassthroughIdleTimeout is how long a per-role
 	// pass-through pool survives without a session. Half an hour is
 	// well past any application's reconnect interval, so a pool is only
@@ -392,6 +399,18 @@ type Config struct {
 	// leaking them until the OS FIN-timeout fires. 0 uses OS default.
 	TCPKeepAlive time.Duration `yaml:"tcp_keepalive"`
 
+	// CancelDialTimeout bounds the second connection pgman opens to
+	// deliver a CancelRequest — the one a client's Ctrl+C turns into.
+	// Unset takes defaultCancelDialTimeout.
+	//
+	// It needs a ceiling of its own because a cancel is a side channel:
+	// the session it belongs to is busy running the query being
+	// cancelled, and the goroutine delivering the cancel has nothing
+	// else bounding it. A backend that accepts the connection and then
+	// says nothing would otherwise hold that goroutine indefinitely,
+	// which is the opposite of what somebody pressing Ctrl+C wants.
+	CancelDialTimeout time.Duration `yaml:"cancel_dial_timeout"`
+
 	// ---- Pool lifecycle defaults (per-pool override in PoolConfig) --
 
 	ServerIdleTimeout  time.Duration `yaml:"server_idle_timeout"`  // close pooled conn if idle > this
@@ -572,6 +591,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ScramPassthroughIdleTimeout == 0 {
 		c.ScramPassthroughIdleTimeout = defaultScramPassthroughIdleTimeout
+	}
+	if c.CancelDialTimeout == 0 {
+		c.CancelDialTimeout = defaultCancelDialTimeout
 	}
 	if c.CircuitBreakerThreshold == 0 {
 		c.CircuitBreakerThreshold = 5

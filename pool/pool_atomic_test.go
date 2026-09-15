@@ -88,17 +88,26 @@ func TestClosedFlagIsAtomicallyVisibleToConcurrentAcquires(t *testing.T) {
 // the conn, otherwise it leaks (never Closed) and the sem slot is
 // never freed.
 func TestReleaseAfterCloseIsIdempotentAndDoesNotLeakConn(t *testing.T) {
-	p := New(pipeDialer(), 2, nil, nil)
+	// The dialer hands out the observable wrapper, so the pool tracks
+	// and the test releases the very same value. Wrapping afterwards
+	// would be releasing a connection this pool never issued, which it
+	// now refuses — correctly, since a slot freed for the wrong
+	// connection is a slot the pool did not have.
+	dial := func(context.Context) (net.Conn, error) {
+		a, _ := net.Pipe()
+		return &observableConn{Conn: a}, nil
+	}
+	p := New(dial, 2, nil, nil)
 
 	// Acquire one, so we have something to Release later.
 	c, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-
-	// Wrap conn to observe Close() from the pool. If the pool leaks
-	// the conn, Close will never be called.
-	obs := &observableConn{Conn: c}
+	obs, ok := c.(*observableConn)
+	if !ok {
+		t.Fatalf("pool handed back %T, want the dialer's wrapper", c)
+	}
 
 	// Close blocks in its drain loop until every in-flight conn has
 	// been Released/Discarded — so we can't sequence "Close then

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -98,6 +99,16 @@ type proxyMetrics struct {
 	ClientLoginFail  *prometheus.CounterVec
 	ClientLoginOK    prometheus.Counter
 	MaxConnRejected  prometheus.Counter
+
+	// The three mechanisms below act on their own, without a client or
+	// an operator asking. Each was observable only as a log line, which
+	// is the wrong shape for the question they raise: not "did it
+	// happen" but "how often", against a graph of something else that
+	// changed at the same time.
+	PreparedStmtEvictions *prometheus.CounterVec
+	PassthroughEvictions  prometheus.Counter
+	ConfigReloads         *prometheus.CounterVec
+	ConfigReloadPools     *prometheus.CounterVec
 }
 
 func newProxyMetrics(reg prometheus.Registerer) *proxyMetrics {
@@ -145,9 +156,54 @@ func newProxyMetrics(reg prometheus.Registerer) *proxyMetrics {
 			Name: "pgman_max_client_conn_rejected_total",
 			Help: "Total client connections rejected because max_client_conn was reached.",
 		}),
+		// A rising rate here is the signal that max_prepared_statements
+		// is below what the workload actually uses: every eviction costs
+		// the next Bind an extra Parse round trip, which shows up as
+		// latency nobody can otherwise explain.
+		PreparedStmtEvictions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgman_prepared_stmt_evictions_total",
+			Help: "Named prepared statements closed on a backend to stay within max_prepared_statements, by pool.",
+		}, []string{"pool"}),
+		PassthroughEvictions: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pgman_passthrough_pools_evicted_total",
+			Help: "SCRAM pass-through pools closed after scram_passthrough_idle_timeout.",
+		}),
+		// Labelled by outcome rather than counted separately, so an
+		// alert can be written on the ratio: a configmap that keeps
+		// failing to parse is invisible otherwise, since the proxy goes
+		// on serving the last good configuration.
+		ConfigReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgman_config_reloads_total",
+			Help: "Config reloads attempted, by result (applied / failed).",
+		}, []string{"result"}),
+		ConfigReloadPools: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgman_config_reload_pools_total",
+			Help: "Pools affected by config reloads, by action (added / removed / reconfigured).",
+		}, []string{"action"}),
 	}
 	reg.MustRegister(m.AcquireWait, m.QueryDuration, m.ClientConnActive, m.ClientConnTotal, m.ClientLoginFail, m.ClientLoginOK, m.MaxConnRejected)
+	reg.MustRegister(m.PreparedStmtEvictions, m.PassthroughEvictions, m.ConfigReloads, m.ConfigReloadPools)
+	reg.MustRegister(newBuildInfoCollector())
 	return m
+}
+
+// newBuildInfoCollector exports the release this process was built from,
+// as the constant-1 gauge with everything in labels that Prometheus
+// projects use for the purpose (node_exporter, and Go's own
+// promhttp/collectors, all spell it this way).
+//
+// It matters more than it looks: images are published automatically and
+// tagged `latest` alongside their version, so "which build is that pod
+// running" is otherwise answered by digging out a digest and mapping it
+// back to a tag by hand. With this, a dashboard can annotate a latency
+// change with the version it started at.
+func newBuildInfoCollector() prometheus.Collector {
+	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pgman_build_info",
+		Help: "Build information. Always 1; the labels are the payload.",
+	}, []string{"version", "go_version"})
+	g.WithLabelValues(version, runtime.Version()).Set(1)
+	return g
 }
 
 // observeQuery records one completed query round-trip. Safe on a nil
@@ -158,6 +214,47 @@ func (m *proxyMetrics) observeQuery(pool string, d time.Duration) {
 		return
 	}
 	m.QueryDuration.WithLabelValues(pool).Observe(d.Seconds())
+}
+
+// observePreparedStmtEviction counts one statement closed on a backend
+// to stay within the cap. Nil-safe like observeQuery: the relay reaches
+// it from a session, and tests build sessions without metrics.
+func (m *proxyMetrics) observePreparedStmtEviction(pool string) {
+	if m == nil {
+		return
+	}
+	m.PreparedStmtEvictions.WithLabelValues(pool).Inc()
+}
+
+// observePassthroughEvictions counts pools the reaper reclaimed.
+func (m *proxyMetrics) observePassthroughEvictions(n int) {
+	if m == nil || n == 0 {
+		return
+	}
+	m.PassthroughEvictions.Add(float64(n))
+}
+
+// observeConfigReload records one reload and what it did. A failed
+// reload reports no pool actions, because it applied none: the proxy
+// keeps serving the configuration it already had.
+func (m *proxyMetrics) observeConfigReload(result ReloadResult, err error) {
+	if m == nil {
+		return
+	}
+	if err != nil {
+		m.ConfigReloads.WithLabelValues("failed").Inc()
+		return
+	}
+	m.ConfigReloads.WithLabelValues("applied").Inc()
+	for action, names := range map[string][]string{
+		"added":        result.Added,
+		"removed":      result.Removed,
+		"reconfigured": result.Reconfigured,
+	} {
+		if len(names) > 0 {
+			m.ConfigReloadPools.WithLabelValues(action).Add(float64(len(names)))
+		}
+	}
 }
 
 // observeAcquire returns a pool.ObserveWaitFunc bound to a pool name —

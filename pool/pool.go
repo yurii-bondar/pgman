@@ -421,7 +421,7 @@ func (p *Pool) Acquire(ctx context.Context) (net.Conn, error) {
 	// Re-check closed after acquiring the slot — Close may have fired
 	// between our select cases resolving and here. Atomic load; no mu.
 	if p.closed.Load() {
-		<-p.sem
+		p.releaseSlot()
 		return nil, ErrPoolClosed
 	}
 
@@ -459,13 +459,13 @@ func (p *Pool) Acquire(ctx context.Context) (net.Conn, error) {
 	// scan on purpose: a tripped breaker must not stop us handing out a
 	// perfectly good warm connection.
 	if !p.circuitAllows() {
-		<-p.sem
+		p.releaseSlot()
 		return nil, ErrCircuitOpen
 	}
 
 	conn, err := p.dialWithRetry(ctx)
 	if err != nil {
-		<-p.sem
+		p.releaseSlot()
 		p.dialErrors.Add(1)
 		p.emit("dial_error", err)
 		p.circuitRecordFailure(err)
@@ -540,24 +540,29 @@ func (p *Pool) popIdle() (idleConn, bool) {
 // how RECONNECT retires in-flight connections without disturbing the
 // active transaction they're carrying.
 func (p *Pool) Release(conn net.Conn) {
+	// One lookup serves three purposes: the ownership check here, the
+	// stale-generation check below, and the true dial time used for
+	// max_lifetime.
+	meta, haveMeta := p.loadMeta(conn)
+	if !haveMeta {
+		p.rejectForeign(conn, "release")
+		return
+	}
+
 	// Fast path: atomically check closed BEFORE taking mu.
 	if p.closed.Load() {
 		p.connMeta.Delete(conn)
 		_ = conn.Close()
-		<-p.sem
+		p.releaseSlot()
 		return
 	}
-
-	// One lookup serves two purposes: the stale-generation check below
-	// and the true dial time used for max_lifetime.
-	meta, haveMeta := p.loadMeta(conn)
 
 	// Stale-generation check: Reconnect() bumped reconnectGen after
 	// this conn was dialed. Discard so the next Acquire dials fresh.
 	if haveMeta && meta.gen < p.reconnectGen.Load() {
 		p.connMeta.Delete(conn)
 		_ = conn.Close()
-		<-p.sem
+		p.releaseSlot()
 		p.discards.Add(1)
 		p.emit("reconnect_discard", nil)
 		return
@@ -584,8 +589,22 @@ func (p *Pool) Release(conn net.Conn) {
 		p.mu.Unlock()
 		p.connMeta.Delete(conn)
 		_ = conn.Close()
-		<-p.sem
+		p.releaseSlot()
 		return
+	}
+	// A connection already sitting in the idle stack is being released a
+	// second time. Appending it again would leave the same conn in the
+	// stack twice, and two Acquires would then hand one connection to two
+	// sessions — they would interleave their traffic on it and the
+	// protocol stream would make no sense to either. Cheaper to notice:
+	// the scan is over at most `limit` pointers, against a release path
+	// that usually involves a round trip to Postgres.
+	for _, ic := range p.idle {
+		if ic.conn == conn {
+			p.mu.Unlock()
+			p.emit("double_release", errDoubleRelease)
+			return
+		}
 	}
 	p.idle = append(p.idle, idleConn{
 		conn:       conn,
@@ -594,17 +613,65 @@ func (p *Pool) Release(conn net.Conn) {
 	})
 	p.mu.Unlock()
 
-	<-p.sem
+	p.releaseSlot()
+}
+
+// releaseSlot gives a semaphore slot back without being able to block.
+//
+// A plain `<-p.sem` deadlocks if the accounting is ever off by one — a
+// connection returned twice, say — and a pooler that hangs inside Release
+// takes its caller's goroutine with it. Refusing to block turns a caller
+// bug into a logged event, which is recoverable and diagnosable.
+func (p *Pool) releaseSlot() {
+	select {
+	case <-p.sem:
+	default:
+		p.emit("slot_underflow", errSlotUnderflow)
+	}
 }
 
 // Discard closes conn and frees its slot without returning it to the idle
 // stack — use when conn is known broken and must never be handed out again.
 func (p *Pool) Discard(conn net.Conn) {
+	if _, haveMeta := p.loadMeta(conn); !haveMeta {
+		p.rejectForeign(conn, "discard")
+		return
+	}
 	p.retire(conn)
-	<-p.sem
+	p.releaseSlot()
 	p.discards.Add(1)
 	p.emit("discard", nil)
 }
+
+// rejectForeign handles a connection handed back to a pool that has no
+// record of it: one dialed by a different pool, or the same connection
+// returned twice.
+//
+// The connection is closed — nobody else is going to — but the semaphore
+// is left alone, and that is the whole point. A slot is fungible: freeing
+// one for a connection this pool never issued frees a slot that belongs
+// to a connection still in flight, so the pool believes it has capacity
+// it does not and hands out more than its limit. Losing a slot is
+// self-limiting; inventing one is not.
+//
+// This is a caller bug either way, so it is reported rather than
+// absorbed silently.
+func (p *Pool) rejectForeign(conn net.Conn, op string) {
+	_ = conn.Close()
+	p.emit("foreign_"+op, errForeignConn)
+}
+
+// errForeignConn marks the event above, so a reader of the event log sees
+// a cause rather than an empty error column.
+var errForeignConn = errors.New("connection was not issued by this pool (or was returned twice)")
+
+// errDoubleRelease and errSlotUnderflow mark the two shapes a
+// return-path accounting bug takes: the same connection handed back
+// twice, and a slot freed that nobody had taken.
+var (
+	errDoubleRelease = errors.New("connection was already idle in this pool")
+	errSlotUnderflow = errors.New("a pool slot was freed that nothing had taken")
+)
 
 // reaper periodically closes idle connections that have exceeded either
 // idleTimeout or maxLifetime. Runs until Close signals done.
@@ -687,6 +754,19 @@ func (p *Pool) warmUp() {
 		default:
 		}
 
+		// Warm-up feeds the breaker below, so it has to obey it too.
+		// Without this a pool with min_pool_size against a dead backend
+		// performs the whole burst the breaker exists to prevent — and
+		// performs most of it after the breaker has already opened,
+		// which is the one moment the backend should be left alone.
+		//
+		// Giving up rather than waiting out the cooldown: warm-up is an
+		// optimisation for the first client, and a backend that is down
+		// at startup will be dialed again by that client anyway.
+		if !p.circuitAllows() {
+			return
+		}
+
 		select {
 		case p.sem <- struct{}{}:
 		case <-p.done:
@@ -695,7 +775,7 @@ func (p *Pool) warmUp() {
 
 		conn, err := p.dial(ctx)
 		if err != nil {
-			<-p.sem
+			p.releaseSlot()
 			p.dialErrors.Add(1)
 			p.emit("dial_error", err)
 			// Warm-up talks to the same backend as Acquire, so its
@@ -712,13 +792,13 @@ func (p *Pool) warmUp() {
 		if p.closed.Load() {
 			p.mu.Unlock()
 			_ = conn.Close()
-			<-p.sem
+			p.releaseSlot()
 			return
 		}
 		p.connMeta.Store(conn, connMeta{gen: p.reconnectGen.Load(), createdAt: now})
 		p.idle = append(p.idle, idleConn{conn: conn, createdAt: now, releasedAt: now})
 		p.mu.Unlock()
-		<-p.sem
+		p.releaseSlot()
 	}
 }
 

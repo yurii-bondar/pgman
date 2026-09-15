@@ -1,0 +1,74 @@
+# Dependency updates as pull requests.
+#
+# This file exists because of a concrete failure: the workflows sat on
+# actions/checkout@v4 and actions/setup-go@v5 until GitHub deprecated
+# their Node 20 runtime and started warning on every run, and
+# golangci-lint-action@v6 until it could no longer read the config in
+# this repository. Both were noticed by reading CI output, which is the
+# expensive way to find out.
+#
+# Weekly rather than daily: these are a proxy's dependencies, not a
+# frontend's, and a PR nobody has time to read is not an update.
+version: 2
+updates:
+  # Actions are the ones that broke, and the ones whose breakage stops
+  # every other check from running.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      # ci: keeps these out of the release notes and out of the version
+      # calculation — see .releaserc.json. An action bump is not a
+      # release of pgman.
+      prefix: ci
+    groups:
+      # One PR for the whole set. They move together (the Node 24
+      # migration touched five at once) and reviewing them separately
+      # means five CI runs to learn the same thing.
+      actions:
+        patterns: ["*"]
+
+  # Go modules for the proxy itself. pgx and the Postgres protocol are
+  # the load-bearing ones; a patch release there is worth a fast look.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      # fix: a dependency bump that ships is a release. For a proxy that
+      # terminates client connections and speaks a wire protocol, "we
+      # updated pgx" is exactly the kind of thing an operator wants to
+      # see a version for.
+      prefix: fix
+    open-pull-requests-limit: 5
+    groups:
+      # Patch bumps rarely need individual attention; anything larger
+      # gets its own PR so the changelog can be read.
+      go-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  # The integration harness is its own module, so it needs its own entry
+  # or it silently stops being updated.
+  - package-ecosystem: gomod
+    directory: /tests/integration
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: test
+    open-pull-requests-limit: 3
+
+  # Base images. The builder pins a Go patch release and the runtime
+  # pins distroless, so neither moves on its own — and distroless is
+  # where a CVE in the base layer would land.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: fix

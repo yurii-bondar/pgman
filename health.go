@@ -2,8 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Liveness and readiness probes.
@@ -111,6 +116,54 @@ func readyHandler(registry *PoolRegistry, draining *atomic.Bool) http.HandlerFun
 		}
 		writeHealthJSON(w, http.StatusOK, resp)
 	}
+}
+
+// probeReadyTimeout bounds the self-probe below. A container health
+// check that hangs is worse than one that fails: Docker keeps the
+// previous verdict while it waits, so a wedged proxy would go on looking
+// healthy.
+const probeReadyTimeout = 3 * time.Second
+
+// probeReady asks a running pgman on this host whether it is ready, and
+// is what `pgman -health-check` runs.
+//
+// It exists because the runtime image is distroless: there is no shell,
+// no curl and no wget to write a HEALTHCHECK with, and adding any of
+// them would put a package manager's worth of attack surface next to a
+// process that terminates database credentials. The binary already
+// speaks HTTP, so it can ask the question itself.
+//
+// metricsAddr is the configured listen address, which is usually a bare
+// port (":8080") or a wildcard — neither is dialable, so the host half is
+// replaced with loopback. That is also the only address a probe running
+// inside the same container should be using.
+func probeReady(metricsAddr string) error {
+	host, port, err := net.SplitHostPort(metricsAddr)
+	if err != nil {
+		return fmt.Errorf("metrics_addr %q: %w", metricsAddr, err)
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "127.0.0.1"
+	}
+
+	client := &http.Client{Timeout: probeReadyTimeout}
+	url := "http://" + net.JoinHostPort(host, port) + "/ready"
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("probe %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		// The body carries the reason /ready decided against itself —
+		// draining, or every backend unreachable — and a health check
+		// that discards it makes the container logs the only place to
+		// find out, which is one indirection too many at 3am.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
+		return fmt.Errorf("not ready (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func writeHealthJSON(w http.ResponseWriter, status int, body healthResponse) {

@@ -143,6 +143,11 @@ type session struct {
 	// to order eviction. Session-local and single-goroutine (only the
 	// relay loop touches it), so a plain uint64 needs no atomics.
 	psClock uint64
+	// metrics is the process-wide metric set, carried on the session so
+	// the prepared-statement path can count an eviction without every
+	// function on it taking runtimeOpts. Nil in tests; every call site
+	// goes through a nil-safe method.
+	metrics *proxyMetrics
 	// psEvicted trips on the first eviction so the operator gets one
 	// warning per session rather than one per statement.
 	psEvicted bool
@@ -287,6 +292,28 @@ type SessionInfo struct {
 	Active      bool
 	ConnectedAt time.Time
 	TxStartedAt time.Time
+}
+
+// sessionsByPool counts live client sessions per registry key.
+//
+// This is what SHOW POOLS reports as cl_active, and it used to report
+// zero: every PgBouncer dashboard built on that column showed a proxy
+// with no clients on it, which is exactly the number somebody checks
+// first when deciding whether traffic is reaching the right place.
+//
+// Counted from the session registry rather than from pool statistics on
+// purpose. A session between transactions holds no backend connection
+// but is very much a connected client, and it is the one an operator is
+// looking for when in_use is low and the application says it is busy.
+func sessionsByPool() map[string]int {
+	infos := listSessions()
+	counts := make(map[string]int, len(infos))
+	for _, info := range infos {
+		if info.PoolName != "" {
+			counts[info.PoolName]++
+		}
+	}
+	return counts
 }
 
 // activeSessionPoolKeys is the set of registry keys some live session

@@ -85,6 +85,11 @@ jobs:
         run: |
           go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # A floor, not a target — see the script for why it is one number
+      # for the whole module. Raise it in the commit that earns it.
+      - name: coverage floor
+        run: scripts/coverage-gate.sh coverage.out 90
+
       - uses: actions/upload-artifact@v7
         with:
           name: coverage

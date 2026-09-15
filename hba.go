@@ -1,23 +1,33 @@
 // Package main — HBA (Host-Based Authentication) rules, PgBouncer-
 // compatible auth_hba_file format.
 //
-// Line format (whitespace-separated, one rule per line):
+// Line format (one rule per line):
 //
 //	TYPE  DATABASE  USER  ADDRESS  METHOD
 //
 // Where:
 //
-//	TYPE     — one of host, hostssl, hostnossl
-//	DATABASE — exact name, "all", or comma-separated list
-//	USER     — exact name, "all", or comma-separated list
-//	ADDRESS  — CIDR (e.g. 10.0.0.0/8, 2001:db8::/32), "all", or "samehost"
-//	METHOD   — one of trust, reject, scram-sha-256
+//	TYPE     — one of host, hostssl, hostnossl, local
+//	DATABASE — exact name, all, or comma-separated list
+//	USER     — exact name, all, or comma-separated list
+//	ADDRESS  — CIDR (e.g. 10.0.0.0/8, 2001:db8::/32), all, or samehost;
+//	           omitted for TYPE=local, which has no address
+//	METHOD   — one of trust, reject, scram-sha-256, peer, cert
 //
 // Lines beginning with `#` and blank lines are ignored. Rules are
 // evaluated in order; the first match wins.
 //
-// This is a strict subset of Postgres/PgBouncer's grammar — no md5,
-// no password, no cert, no ldap, no user maps. Extend later if needed.
+// Keywords (all, samehost, the type and method names) are recognised
+// case-insensitively, and — as in Postgres — double-quoting a value
+// suppresses its keyword meaning: `"all"` is a database or role
+// literally called all, not the wildcard. Whitespace after a comma in a
+// list is allowed, which Postgres's own parser rejects; the alternative
+// was reading `app, reports all all trust` as six fields and silently
+// mistaking the third one for an address.
+//
+// This is a strict subset of Postgres/PgBouncer's grammar — no md5, no
+// password, no ldap, no user maps, and no per-method options. Extend
+// later if needed.
 package main
 
 import (
@@ -31,6 +41,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -79,11 +90,21 @@ const (
 
 // HBARule is one parsed line from the auth_hba_file.
 type HBARule struct {
-	Type      HBAConnType
-	Databases []string   // exact names or "all"
-	Users     []string   // exact names or "all"
-	Net       *net.IPNet // nil means "all"
-	Samehost  bool       // "samehost" — allow only loopback
+	Type HBAConnType
+	// AllDatabases / AllUsers record the `all` keyword, as opposed to a
+	// name that happens to be spelled that way.
+	//
+	// A flag rather than the string "all" in the list below, because the
+	// two are genuinely different things and conflating them made the
+	// keyword match case-sensitively while names did not: a rule reading
+	// `host ALL ALL all trust` matched only a database and role literally
+	// called all, which is the opposite of what it says.
+	AllDatabases bool
+	AllUsers     bool
+	Databases    []string   // explicit names; empty when AllDatabases
+	Users        []string   // explicit names; empty when AllUsers
+	Net          *net.IPNet // nil means any address
+	Samehost     bool       // "samehost" — allow only loopback
 
 	Method HBAMethod
 
@@ -125,14 +146,120 @@ func LoadHBAFile(path string) ([]HBARule, error) {
 	return rules, nil
 }
 
+// hbaItem is one element of one field, unquoted, remembering whether it
+// arrived in quotes. The flag is what distinguishes the `all` keyword
+// from a database or role of that name.
+type hbaItem struct {
+	value  string
+	quoted bool
+}
+
+// isKeyword reports whether this item is the given unquoted keyword.
+func (i hbaItem) isKeyword(word string) bool {
+	return !i.quoted && strings.EqualFold(i.value, word)
+}
+
+// tokenizeHBALine splits one line into fields, and each field into its
+// comma-separated items.
+//
+// It exists because strings.Fields plus a comma split — what this used
+// to do — cannot tell those two separators apart. `host app, reports all
+// all trust` became six fields, and the rule was then read with the
+// third field as its ADDRESS: a line that looks like it grants two
+// databases parses into something else entirely, or into an error whose
+// message points at the wrong field.
+func tokenizeHBALine(raw string) ([][]hbaItem, error) {
+	var (
+		fields   [][]hbaItem
+		cur      []hbaItem
+		item     strings.Builder
+		quoted   bool // the item being built was opened with a quote
+		inQuotes bool
+		started  bool // an item is under construction, possibly empty ("")
+		// afterComma keeps a field open across whitespace, which is what
+		// makes `app, reports` one list instead of two fields.
+		afterComma bool
+	)
+
+	endItem := func() {
+		cur = append(cur, hbaItem{value: item.String(), quoted: quoted})
+		item.Reset()
+		quoted, started = false, false
+	}
+	endField := func() {
+		if started {
+			endItem()
+		}
+		if len(cur) > 0 {
+			fields = append(fields, cur)
+			cur = nil
+		}
+	}
+
+	for _, r := range raw {
+		switch {
+		case inQuotes:
+			if r == '"' {
+				inQuotes = false
+				continue
+			}
+			item.WriteRune(r)
+			started = true
+		case r == '"':
+			inQuotes, quoted, started, afterComma = true, true, true, false
+		case r == ',':
+			if started {
+				endItem()
+			} else if len(cur) == 0 && len(fields) > 0 {
+				// A comma at the start of a field re-opens the previous
+				// one, so `app ,reports` is the same list as `app,
+				// reports`. Both spellings are what an operator means,
+				// and neither should turn into two fields.
+				cur = fields[len(fields)-1]
+				fields = fields[:len(fields)-1]
+			}
+			afterComma = true
+		case unicode.IsSpace(r):
+			if started {
+				endItem()
+			}
+			if !afterComma {
+				endField()
+			}
+		default:
+			item.WriteRune(r)
+			started, afterComma = true, false
+		}
+	}
+	if inQuotes {
+		return nil, errors.New("unterminated double quote")
+	}
+	endField()
+	return fields, nil
+}
+
 func parseHBALine(raw string) (HBARule, error) {
-	fields := strings.Fields(raw)
+	fields, err := tokenizeHBALine(raw)
+	if err != nil {
+		return HBARule{}, err
+	}
 	if len(fields) < 5 {
 		return HBARule{}, errors.New("expected 5 fields: TYPE DATABASE USER ADDRESS METHOD")
 	}
+	// Extra fields are refused rather than ignored. Postgres puts
+	// per-method options here (clientcert=verify-full and friends) and
+	// pgman supports none of them, so accepting them silently would let
+	// an operator write a restriction that never applies.
+	if len(fields) > 5 {
+		return HBARule{}, fmt.Errorf("expected 5 fields, got %d — per-method options are not supported", len(fields))
+	}
 
 	var rule HBARule
-	switch strings.ToLower(fields[0]) {
+	typeField, err := singleItem(fields[0], "TYPE")
+	if err != nil {
+		return HBARule{}, err
+	}
+	switch strings.ToLower(typeField.value) {
 	case "host":
 		rule.Type = HBAHostAny
 	case "hostssl":
@@ -142,26 +269,38 @@ func parseHBALine(raw string) (HBARule, error) {
 	case "local":
 		rule.Type = HBALocal
 	default:
-		return HBARule{}, fmt.Errorf("unknown connection type %q (want host / hostssl / hostnossl / local)", fields[0])
+		return HBARule{}, fmt.Errorf("unknown connection type %q (want host / hostssl / hostnossl / local)", typeField.value)
 	}
 
-	rule.Databases = splitCSV(fields[1])
-	rule.Users = splitCSV(fields[2])
+	if rule.AllDatabases, rule.Databases, err = parseNameList(fields[1], "DATABASE"); err != nil {
+		return HBARule{}, err
+	}
+	if rule.AllUsers, rule.Users, err = parseNameList(fields[2], "USER"); err != nil {
+		return HBARule{}, err
+	}
 
-	switch strings.ToLower(fields[3]) {
-	case "all":
+	addr, err := singleItem(fields[3], "ADDRESS")
+	if err != nil {
+		return HBARule{}, err
+	}
+	switch {
+	case addr.isKeyword("all"):
 		// leave rule.Net nil, samehost false — matches any address
-	case "samehost":
+	case addr.isKeyword("samehost"):
 		rule.Samehost = true
 	default:
-		_, ipnet, err := net.ParseCIDR(fields[3])
+		_, ipnet, err := net.ParseCIDR(addr.value)
 		if err != nil {
-			return HBARule{}, fmt.Errorf("invalid ADDRESS %q: %w", fields[3], err)
+			return HBARule{}, fmt.Errorf("invalid ADDRESS %q: %w", addr.value, err)
 		}
 		rule.Net = ipnet
 	}
 
-	switch strings.ToLower(fields[4]) {
+	method, err := singleItem(fields[4], "METHOD")
+	if err != nil {
+		return HBARule{}, err
+	}
+	switch strings.ToLower(method.value) {
 	case "trust":
 		rule.Method = HBAMethodTrust
 	case "reject":
@@ -173,22 +312,45 @@ func parseHBALine(raw string) (HBARule, error) {
 	case "cert":
 		rule.Method = HBAMethodCert
 	default:
-		return HBARule{}, fmt.Errorf("unsupported METHOD %q (want trust / reject / scram-sha-256 / peer / cert)", fields[4])
+		return HBARule{}, fmt.Errorf("unsupported METHOD %q (want trust / reject / scram-sha-256 / peer / cert)", method.value)
 	}
 
 	return rule, nil
 }
 
-func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
+// singleItem enforces that a field which cannot be a list is not one. A
+// comma in TYPE, ADDRESS or METHOD is a typo, and reading only its first
+// element would apply a rule narrower than what was written.
+func singleItem(field []hbaItem, what string) (hbaItem, error) {
+	if len(field) != 1 {
+		return hbaItem{}, fmt.Errorf("%s does not take a list", what)
 	}
-	return out
+	return field[0], nil
+}
+
+// parseNameList reads a DATABASE or USER field: either the `all`
+// keyword, or one or more explicit names.
+//
+// An empty list is an error rather than a rule that matches nothing:
+// `host , all all trust` is a typo, and a rule that can never match is
+// indistinguishable from a rule that is not there — except that it sits
+// in the file looking like it does something.
+func parseNameList(field []hbaItem, what string) (all bool, names []string, err error) {
+	if len(field) == 0 {
+		return false, nil, fmt.Errorf("%s is empty", what)
+	}
+	for _, item := range field {
+		if item.isKeyword("all") {
+			// `all` alongside names is redundant, not contradictory:
+			// everything matches either way.
+			return true, nil, nil
+		}
+		if item.value == "" {
+			return false, nil, fmt.Errorf("%s contains an empty name", what)
+		}
+		names = append(names, item.value)
+	}
+	return false, names, nil
 }
 
 // MatchHBA walks rules in order and returns the first rule that matches
@@ -204,10 +366,10 @@ func MatchHBA(rules []HBARule, tls, isUnix bool, remoteIP net.IP, user, database
 		if !matchHBAType(r.Type, tls, isUnix) {
 			continue
 		}
-		if !matchHBAList(r.Databases, database) {
+		if !matchHBAName(r.AllDatabases, r.Databases, database) {
 			continue
 		}
-		if !matchHBAList(r.Users, user) {
+		if !matchHBAName(r.AllUsers, r.Users, user) {
 			continue
 		}
 		if !matchHBAAddr(r, remoteIP) {
@@ -232,9 +394,16 @@ func matchHBAType(t HBAConnType, tls, isUnix bool) bool {
 	return false
 }
 
-func matchHBAList(list []string, val string) bool {
-	for _, x := range list {
-		if x == "all" || strings.EqualFold(x, val) {
+// matchHBAName tests a connection's database or role against a rule's
+// field. Names compare case-insensitively, the way Postgres folds
+// unquoted identifiers, and `all` is a flag rather than a name in the
+// list — see HBARule.
+func matchHBAName(all bool, names []string, val string) bool {
+	if all {
+		return true
+	}
+	for _, n := range names {
+		if strings.EqualFold(n, val) {
 			return true
 		}
 	}
@@ -314,7 +483,16 @@ func (h *HBAAuth) Authenticate(pg *pgproto3.Backend, conn net.Conn, startup *pgp
 	case HBAMethodCert:
 		return h.authenticateCert(pg, conn, user, isTLS, rule.LineNum)
 	}
-	return fmt.Errorf("hba: unhandled method %q", rule.Method)
+	// Reachable only if a method is added to the parser and not to this
+	// switch. It still has to tell the client, because a denial is a
+	// denial: every other branch here sends a FATAL, and this one used
+	// to close the socket in silence — which a driver reports as a reset
+	// and a retry loop treats as a transient network fault.
+	slog.Error("hba: rule matched a method this build cannot perform",
+		"line", rule.LineNum, "method", rule.Method, "user", user, "database", database)
+	hbaReject(pg, fmt.Sprintf("pg_hba.conf line %d uses method %q, which this pgman build cannot perform",
+		rule.LineNum, rule.Method))
+	return fmt.Errorf("hba: unhandled method %q at line %d", rule.Method, rule.LineNum)
 }
 
 // authenticateCert enforces mTLS identity: the client MUST have

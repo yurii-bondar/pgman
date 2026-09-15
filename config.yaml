@@ -25,6 +25,29 @@ tls_key_file: "certs/server.key"
 auth_users:
   rgs: "SCRAM-SHA-256$4096:PDleUJSqWGThS77n6IaYiQ==$suBycl9o9+u6tHTq5XCcL9ZepPhAut3KA/Dtdi1wgOM=:zUnH1fzQ1MM7+8Lru2+voRbOK5s8OKumgunqoyfrq5E="
 
+# Host-based authentication, in Postgres/PgBouncer pg_hba format. When set,
+# every client is matched against the rules in order and the first match
+# decides how — or whether — it authenticates. Unset ⇒ every client goes
+# straight to the auth_users/auth_query path above.
+#
+#   TYPE      DATABASE   USER    ADDRESS       METHOD
+#   local     all        all     -             peer
+#   hostssl   shop       alice   10.0.0.0/8    scram-sha-256
+#   hostssl   all        all     samehost      cert
+#   host      all        all     all           reject
+#
+# TYPE is host / hostssl / hostnossl / local; METHOD is trust / reject /
+# scram-sha-256 / peer (Unix socket, SO_PEERCRED identity, Linux only) /
+# cert (mTLS, the client certificate's CN must equal the requested user).
+# DATABASE and USER take a name, a comma-separated list, or the keyword
+# `all`. Keywords are case-insensitive, and double-quoting a value makes
+# it a literal name: "all" is a database called all, not the wildcard.
+#
+# Put `reject all` last if the file is meant to be exhaustive — a
+# connection matching no rule is denied either way, but saying so leaves
+# the intent in the file.
+# auth_hba_file: "/etc/pgman/pg_hba.conf"
+
 # Roles allowed into the PgBouncer-compatible admin console (the virtual
 # `admin_database`, default "pgbouncer"). Empty ⇒ nobody, which is the
 # default: that console can PAUSE every pool and SHOW CLIENTS lists every
@@ -110,6 +133,13 @@ server_reset_query_skip_same_session: false
 max_prepared_statements: 200                # 0 = default (200), negative = no cap
 
 tcp_keepalive: "30s"                        # detect vanished peers instead of leaking FDs
+
+# Bound on the second connection pgman opens to deliver a CancelRequest —
+# what a client's Ctrl+C becomes. It needs its own ceiling because a cancel is
+# a side channel: the session it belongs to is busy running the query being
+# cancelled, so nothing else bounds the goroutine delivering it. Short on
+# purpose — a cancel undelivered in five seconds has been overtaken by events.
+cancel_dial_timeout: "5s"                   # 0 = default (5s)
 
 # How long a SCRAM pass-through pool may sit unused before it is closed.
 # These pools cannot be declared here — one is created per role the first

@@ -63,8 +63,8 @@ func TestLoadHBAFile_MalformedLineFails(t *testing.T) {
 
 func TestMatchHBA_FirstMatchWins(t *testing.T) {
 	rules := []HBARule{
-		{Type: HBAHostAny, Databases: []string{"secret"}, Users: []string{"all"}, Method: HBAMethodReject},
-		{Type: HBAHostAny, Databases: []string{"all"}, Users: []string{"all"}, Method: HBAMethodTrust},
+		{Type: HBAHostAny, Databases: []string{"secret"}, AllUsers: true, Method: HBAMethodReject},
+		{Type: HBAHostAny, AllDatabases: true, AllUsers: true, Method: HBAMethodTrust},
 	}
 	// Client asks for "secret" — first rule matches → reject.
 	got, ok := MatchHBA(rules, false, false, net.ParseIP("10.0.0.1"), "alice", "secret")
@@ -80,7 +80,7 @@ func TestMatchHBA_FirstMatchWins(t *testing.T) {
 
 func TestMatchHBA_TLSTypeFiltering(t *testing.T) {
 	rules := []HBARule{
-		{Type: HBAHostSSL, Databases: []string{"all"}, Users: []string{"all"}, Method: HBAMethodTrust},
+		{Type: HBAHostSSL, AllDatabases: true, AllUsers: true, Method: HBAMethodTrust},
 	}
 	// Plain conn — hostssl rule must NOT match.
 	if _, ok := MatchHBA(rules, false, false, net.ParseIP("1.2.3.4"), "u", "d"); ok {
@@ -95,7 +95,7 @@ func TestMatchHBA_TLSTypeFiltering(t *testing.T) {
 func TestMatchHBA_CIDR(t *testing.T) {
 	_, net10, _ := net.ParseCIDR("10.0.0.0/8")
 	rules := []HBARule{
-		{Type: HBAHostAny, Databases: []string{"all"}, Users: []string{"all"}, Net: net10, Method: HBAMethodTrust},
+		{Type: HBAHostAny, AllDatabases: true, AllUsers: true, Net: net10, Method: HBAMethodTrust},
 	}
 	if _, ok := MatchHBA(rules, false, false, net.ParseIP("10.5.5.5"), "u", "d"); !ok {
 		t.Error("CIDR should include 10.5.5.5")
@@ -122,7 +122,7 @@ func TestMatchHBA_UserAndDBLists(t *testing.T) {
 
 func TestMatchHBA_Samehost(t *testing.T) {
 	rules := []HBARule{
-		{Type: HBAHostAny, Databases: []string{"all"}, Users: []string{"all"}, Samehost: true, Method: HBAMethodTrust},
+		{Type: HBAHostAny, AllDatabases: true, AllUsers: true, Samehost: true, Method: HBAMethodTrust},
 	}
 	if _, ok := MatchHBA(rules, false, false, net.ParseIP("127.0.0.1"), "u", "d"); !ok {
 		t.Error("samehost should match loopback")

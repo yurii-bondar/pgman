@@ -43,5 +43,20 @@ EXPOSE 6435 8080 8081
 # the :nonroot tag, but being explicit documents the intent.
 USER nonroot:nonroot
 
+# The binary probes itself, because there is no shell, curl or wget in a
+# distroless image to write this with — and adding one would put a
+# package manager's worth of attack surface next to a process that
+# terminates database credentials.
+#
+# It asks /ready, so the check follows readiness: a container draining on
+# SIGTERM reports unhealthy, which is what stops Swarm or Compose from
+# sending it new work. Kubernetes ignores this and uses its own probes
+# against the same endpoint.
+#
+# start-period is generous because readiness waits on the first backend
+# dial, and a Postgres coming up alongside it can take a while.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/pgman", "-config", "/etc/pgman/config.yaml", "-health-check"]
+
 ENTRYPOINT ["/pgman"]
 CMD ["-config", "/etc/pgman/config.yaml"]
