@@ -74,6 +74,18 @@ client_login_timeout: "60s"                 # startup+auth deadline; defends aga
 query_wait_timeout: "120s"                  # max Acquire wait on saturated pool
 server_reset_query: "DISCARD ALL"           # session-state scrub between clients
 
+# The scrub runs when a connection passes from one session to another, not
+# on every release: between two transactions of the SAME session it isolates
+# that session from itself, at the cost of two round trips (the DISCARD plus
+# the tracked-parameter replay that restores what it wiped). Isolation
+# between different clients is identical either way.
+#
+# Turn this on for determinism rather than safety: with it off, a session
+# level SET survives into the next transaction whenever the pool hands back
+# the same connection, so an app can appear to get away with session state
+# in transaction pooling until load starts moving connections around.
+server_reset_query_always: false
+
 # Cap on named prepared statements tracked per client session. Every entry
 # holds the statement's full SQL text, and the client chooses both the names
 # and how many — so an uncapped cache is an OOM primitive. Past the cap the

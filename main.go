@@ -48,6 +48,9 @@ type runtimeOpts struct {
 	clientIdleTimeout      time.Duration
 	idleTransactionTimeout time.Duration
 	serverResetQuery       string
+	// resetQueryAlways forces the scrub even when the same session
+	// reacquires the connection. See Config.ServerResetQueryAlways.
+	resetQueryAlways bool
 
 	// clientSlots is the max_client_conn semaphore: one buffered slot
 	// per admissible client connection, nil meaning unlimited.
@@ -134,6 +137,7 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		idleTransactionTimeout: cfg.IdleTransactionTimeout,
 
 		serverResetQuery: cfg.ServerResetQuery,
+		resetQueryAlways: cfg.ServerResetQueryAlways,
 		maxPreparedStmts: cfg.MaxPreparedStatements,
 		metrics:          metrics,
 		adminDatabase:    cfg.AdminDatabase,
@@ -1220,30 +1224,12 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 		// read fail instantly, which is about as hard to diagnose as
 		// bugs get.
 		_ = backend.SetReadDeadline(time.Time{})
-		// The backend's prepared-statement set records which statements
-		// THIS session taught it, and statement names are per-client.
-		// It therefore must not survive the handover, whatever
-		// server_reset_query is set to: the next session's Bind for a
-		// name that happens to collide would find the backend "already
-		// knows" it, skip the lazy Parse, and silently execute the
-		// previous client's statement.
-		//
-		// Unconditional on purpose. Doing this only when
-		// server_reset_query is configured made correctness here a
-		// property of the config rather than of the code.
-		clearBackendPSCache(backend)
 		if reusable {
-			if opts.serverResetQuery != "" {
-				if err := runResetQuery(backend, opts.serverResetQuery, opts.healthCheckTimeout); err != nil {
-					// A failed reset means we can't guarantee session
-					// isolation — discard instead of reusing.
-					slog.Warn("relay: server_reset_query failed, discarding backend", "err", err)
-					p.Discard(backend)
-					backend, fe = nil, nil
-					sess.setBackend(nil)
-					return
-				}
-			}
+			// No scrub here, and no round trip. The connection keeps
+			// carrying this session's state, tagged with whose it is;
+			// adoptBackend does the scrubbing when — and only when — a
+			// different session picks it up. See stateOwner.
+			backend.stateOwner = sess.id
 			p.Release(backend)
 		} else {
 			p.Discard(backend)
@@ -1371,16 +1357,20 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 			fe = pgproto3.NewFrontend(backend, backend)
 			sess.setBackend(backend)
 
-			// application_name & friends: replay startup params on
-			// the freshly-acquired backend so pg_stat_activity /
-			// TimeZone / client_encoding match what the client asked
-			// for. Silent — the client never sees these SETs.
-			if len(sess.trackedParams) > 0 {
-				if err := applyTrackedParams(fe, sess.trackedParams); err != nil {
-					slog.Warn("relay: apply tracked params", "err", err)
-					release(false)
+			if err := adoptBackend(fe, backend, sess, opts); err != nil {
+				// The connection could not be made safe for this
+				// session, so it must not be handed over. Discard it
+				// and fail this one query rather than the session: a
+				// retry lands on a different (or fresh) backend, which
+				// is very likely to work.
+				slog.Warn("relay: adopting backend failed", "err", err)
+				p.Discard(backend)
+				backend, fe = nil, nil
+				sess.setBackend(nil)
+				if err := failQuery(pg, msg, "08006", "backend could not be prepared for this session: "+err.Error()); err != nil {
 					return
 				}
+				continue
 			}
 		}
 
@@ -1585,6 +1575,77 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 			break
 		}
 	}
+}
+
+// adoptBackend makes a just-acquired connection safe and correct for
+// sess to use, and is where server_reset_query now runs.
+//
+// The scrub used to happen on release, which cost a full round trip at
+// the end of every transaction — and with track_extra_parameters on by
+// default, the replay of application_name and friends cost another one
+// at the start of the next. Both were paid even when the connection
+// went straight back to the session that had just handed it over,
+// which with a LIFO pool and a serial client is the overwhelmingly
+// common case. Between two transactions of the same session those two
+// round trips scrub state the session owns, only to immediately
+// restore it: the isolation they provide is isolation from nobody.
+//
+// So the work is deferred to here, where the next owner is finally
+// known, and skipped outright when that owner is unchanged. What the
+// deferral does NOT do is weaken isolation: no statement from a new
+// session reaches the backend before the scrub, because this runs
+// before the first message is forwarded.
+//
+// The trade is that a released connection now sits in the idle stack
+// still holding its last owner's session state — GUCs, prepared
+// statements, temp tables, session advisory locks — instead of being
+// scrubbed immediately. That state belongs to a client that is still
+// connected and, in transaction pooling, usually about to come back;
+// server_idle_timeout and server_lifetime bound how long it can linger
+// if that client goes quiet instead.
+func adoptBackend(fe *pgproto3.Frontend, backend *backendConn, sess *session, opts *runtimeOpts) error {
+	// Every session that touches a connection needs a real identity, or
+	// two sessions built outside registerSession would both read as 0
+	// and hand each other an unscrubbed backend. Issued lazily here so
+	// the guarantee holds for any session, however it was constructed.
+	if sess.id == 0 {
+		sess.id = nextSessionID.Add(1)
+	}
+	if backend.stateOwner == sess.id && !opts.resetQueryAlways {
+		return nil // our own state, already in place: nothing to do
+	}
+
+	// stateOwner == 0 is a connection nobody has used yet, so there is
+	// nothing to scrub — but its GUCs are still Postgres defaults, so
+	// the tracked-parameter replay below still has to run.
+	if backend.stateOwner != 0 && opts.serverResetQuery != "" {
+		if err := runResetQuery(fe, backend, opts.serverResetQuery, opts.healthCheckTimeout); err != nil {
+			return fmt.Errorf("server_reset_query: %w", err)
+		}
+	}
+
+	// Drop the record of which statements the backend was shown. It is
+	// the previous session's, and statement names are chosen per
+	// client: left in place, this session's Bind for a colliding name
+	// would skip its lazy Parse and run the other client's statement.
+	//
+	// Note this happens whether or not the reset query ran. When an
+	// operator disables server_reset_query the statements themselves
+	// survive on the backend and a colliding name now raises 42P05,
+	// which is a loud, correct failure rather than a silent wrong one.
+	clearBackendPSCache(backend)
+
+	// application_name & friends: replay startup params so
+	// pg_stat_activity / TimeZone / client_encoding match what the
+	// client asked for. Silent — the client never sees these SETs.
+	if len(sess.trackedParams) > 0 {
+		if err := applyTrackedParams(fe, sess.trackedParams); err != nil {
+			return fmt.Errorf("apply tracked params: %w", err)
+		}
+	}
+
+	backend.stateOwner = sess.id
+	return nil
 }
 
 // clientFlushThreshold is how many bytes of backend replies may sit in
@@ -1867,7 +1928,11 @@ func relayCopyIn(pg *pgproto3.Backend, fe *pgproto3.Frontend) error {
 // runResetQuery sends the configured server_reset_query on the backend
 // and consumes until ReadyForQuery. Uses the same deadline as the
 // health-check path since it's the same round-trip shape.
-func runResetQuery(backend *backendConn, query string, timeout time.Duration) error {
+// fe is the caller's own Frontend rather than a fresh one. Two
+// Frontends reading the same socket is a desync waiting to happen — the
+// one that is thrown away takes whatever it has buffered with it — and
+// reusing the live one also skips a per-transaction allocation.
+func runResetQuery(fe *pgproto3.Frontend, backend *backendConn, query string, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
@@ -1876,7 +1941,6 @@ func runResetQuery(backend *backendConn, query string, timeout time.Duration) er
 	}
 	defer func() { _ = backend.SetDeadline(time.Time{}) }()
 
-	fe := pgproto3.NewFrontend(backend, backend)
 	fe.Send(&pgproto3.Query{String: query})
 	if err := fe.Flush(); err != nil {
 		return fmt.Errorf("send: %w", err)

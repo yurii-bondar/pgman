@@ -297,6 +297,25 @@ type Config struct {
 	// Mirrors PgBouncer's server_reset_query.
 	ServerResetQuery string `yaml:"server_reset_query"`
 
+	// ServerResetQueryAlways runs ServerResetQuery on every backend
+	// handover, including when the connection goes straight back to the
+	// session that just released it.
+	//
+	// Off by default, because that scrub isolates a session from itself
+	// and costs two round trips per transaction to do it (the DISCARD
+	// plus the tracked-parameter replay that restores what it wiped).
+	// Isolation between *different* clients is unaffected either way —
+	// see adoptBackend.
+	//
+	// The reason to turn it on is determinism rather than safety. With
+	// it off, a session-level SET survives into the next transaction
+	// whenever the pool hands back the same connection and is lost when
+	// it doesn't, so a client can appear to get away with session state
+	// in transaction pooling until load makes connections start moving
+	// between clients. On, session state is reliably discarded, exactly
+	// as before this option existed.
+	ServerResetQueryAlways bool `yaml:"server_reset_query_always"`
+
 	// TCPKeepAlive interval on both accepted client sockets and dialed
 	// backend sockets — detects and evicts dead peers instead of
 	// leaking them until the OS FIN-timeout fires. 0 uses OS default.

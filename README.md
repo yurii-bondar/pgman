@@ -89,7 +89,8 @@ exists. The settings worth knowing up front:
 | `circuit_breaker_threshold` | Consecutive dial failures before failing fast. | `5` |
 | `circuit_breaker_cooldown` | How long the breaker stays open. | `5s` |
 | `require_backend_tls` | Refuse pools whose DSN does not mandate TLS. | `false` |
-| `server_reset_query` | Scrub run before a backend re-enters the pool. | `DISCARD ALL` |
+| `server_reset_query` | Scrub run before a backend is handed to a different session. | `DISCARD ALL` |
+| `server_reset_query_always` | Scrub on every acquire, including same-session reuse. | `false` |
 | `server_lifetime` | Max age of a backend connection, from dial. | unset |
 | `server_idle_timeout` | Max idle time before a backend is closed. | unset |
 | `shutdown_timeout` | Drain budget on `SIGTERM`. | `30s` |
@@ -213,6 +214,14 @@ Honest list, so nobody discovers these in an incident:
   working, but a Bind for an evicted name can reach a backend that never
   saw the Parse and get `26000` back; drivers with their own statement
   cache re-Parse through that.
+- **Session state can survive a transaction when the pool hands back the
+  same connection.** `server_reset_query` runs on handover to a
+  different session, not on every release, so a session-level `SET` in
+  transaction pooling is lost sometimes and not others — an app can
+  appear to get away with it until load starts moving connections
+  between clients. Isolation between different clients is unaffected.
+  Set `server_reset_query_always: true` to trade two round trips per
+  transaction for the deterministic behaviour.
 - **`SIGHUP` does not resize or re-target existing pools** — only adds
   and removes them. Changing a limit, DSN or TLS setting needs a restart.
 - **No online restart (`-R`).** This is deliberate; see `DEV_PLAN.md`

@@ -11,7 +11,7 @@ import (
 	"github.com/yurii-bondar/pgman/pool"
 )
 
-// TestBackendPSCacheClearedOnReleaseWithoutResetQuery is the regression
+// TestBackendPSCacheClearedBeforeAnotherSessionUsesIt is the regression
 // for a cross-session statement mix-up.
 //
 // backendConn.preparedStmts is the only thing that makes
@@ -23,9 +23,15 @@ import (
 // exception — then found the backend "already knows" it, skipped the
 // Parse, and ran A's SQL under B's identity.
 //
+// The clearing now happens when a different session adopts the
+// connection rather than when the previous one lets go of it, so this
+// asserts the guarantee at that boundary. Between the two the backend
+// legitimately still carries A's statements: A owns them, and if A gets
+// its own connection back the cache is still accurate.
+//
 // The test deliberately runs with server_reset_query disabled: that is
 // the configuration the old code got wrong.
-func TestBackendPSCacheClearedOnReleaseWithoutResetQuery(t *testing.T) {
+func TestBackendPSCacheClearedBeforeAnotherSessionUsesIt(t *testing.T) {
 	backendClient, backendServer := net.Pipe()
 	t.Cleanup(func() { backendClient.Close(); backendServer.Close() })
 	backendPG := pgproto3.NewBackend(backendServer, backendServer)
@@ -103,18 +109,26 @@ func TestBackendPSCacheClearedOnReleaseWithoutResetQuery(t *testing.T) {
 	if !ok {
 		t.Fatalf("pool handed back %T, want *backendConn", conn)
 	}
-	if n := len(recycled.preparedStmts); n != 0 {
-		t.Fatalf("released backend still claims to know %d statement(s) from the previous session", n)
+	if recycled.stateOwner == 0 {
+		t.Fatal("the released backend is not tagged with its owner, so no handover can be detected")
 	}
 
-	// The consequence that actually matters: session B, which has its
-	// own "stmtcache_1" meaning something else entirely, must get its
-	// own Parse prepended rather than inheriting A's.
+	// Session B adopts it, exactly as relayImpl does on acquire.
 	sessB := &session{
 		user: "b", database: "d", poolMode: "transaction",
 		psCache: psCache{"stmtcache_1": &prepStmtInfo{SQL: "SELECT 'session B query'"}},
 	}
 	feB := pgproto3.NewFrontend(recycled, recycled)
+	if err := adoptBackend(feB, recycled, sessB, opts); err != nil {
+		t.Fatalf("adoptBackend: %v", err)
+	}
+	if n := len(recycled.preparedStmts); n != 0 {
+		t.Fatalf("adopted backend still claims to know %d statement(s) from the previous session", n)
+	}
+
+	// The consequence that actually matters: session B, which has its
+	// own "stmtcache_1" meaning something else entirely, must get its
+	// own Parse prepended rather than inheriting A's.
 	_, swallow := ensureBackendHasStmt(feB, recycled, sessB, "stmtcache_1",
 		&pgproto3.Bind{PreparedStatement: "stmtcache_1"})
 	if swallow != 1 {

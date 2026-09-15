@@ -11,6 +11,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -55,6 +56,18 @@ type backendConn struct {
 	pid       uint32
 	secretKey []byte
 
+	// stateOwner is the id of the session whose session-level state this
+	// connection currently carries: its GUCs, prepared statements, temp
+	// tables, advisory locks. 0 means freshly dialed — it carries
+	// nobody's.
+	//
+	// This is what lets the proxy skip server_reset_query. A scrub
+	// exists to isolate one client from another; running it between two
+	// transactions of the SAME session protects nobody, and with a LIFO
+	// pool a serial client gets its own connection back nearly every
+	// time. Compared at Acquire, where the next owner is finally known.
+	stateOwner uint64
+
 	// cancelTLS is the TLS configuration a CancelRequest for this
 	// backend must use. Non-nil exactly when the backend connection
 	// itself was established over TLS.
@@ -81,6 +94,16 @@ type trackedParam struct {
 }
 
 type session struct {
+	// id is a process-unique, monotonic session identity, used to match
+	// a session against backendConn.stateOwner. Distinct from the fake
+	// PID handed to the client: that one is random (it is a cancel-key
+	// component) and could in principle repeat.
+	//
+	// Zero means "not yet issued" — a session built outside
+	// registerSession. adoptBackend assigns one lazily before the id is
+	// ever compared, so no two sessions can look alike to stateOwner.
+	id uint64
+
 	secret      []byte
 	user        string
 	database    string
@@ -180,6 +203,12 @@ func (r *sessionRegistry) shardFor(pid uint32) *sessionShard {
 // existing tests) don't have to plumb a *sessionRegistry through.
 var globalSessions = newSessionRegistry()
 
+// nextSessionID issues session.id values. A plain counter, not random:
+// it is never sent to a client, it only has to be unique within this
+// process, and uniqueness is exactly what the stateOwner comparison
+// needs to be sound.
+var nextSessionID atomic.Uint64
+
 // randUint32 reads 4 bytes of crypto/rand as a uint32. crypto/rand
 // failure means the OS entropy source is broken — panic loudly.
 func randUint32() uint32 {
@@ -220,7 +249,13 @@ func registerSession(user, database string) (pid uint32, sess *session) {
 			continue
 		}
 		secret := randSecret()
-		sess = &session{secret: secret, user: user, database: database, connectedAt: time.Now()}
+		sess = &session{
+			id:          nextSessionID.Add(1), // starts at 1; 0 stays reserved for "unknown"
+			secret:      secret,
+			user:        user,
+			database:    database,
+			connectedAt: time.Now(),
+		}
 		shard.sessions[p] = sess
 		shard.mu.Unlock()
 		return p, sess
