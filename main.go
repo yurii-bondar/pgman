@@ -1507,7 +1507,7 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 				// Replication streams are open-ended by design — a
 				// walsender can idle for minutes between WAL records.
 				_ = backend.SetReadDeadline(time.Time{})
-				if err := relayCopyBoth(pg, fe); err != nil {
+				if err := relayCopyBoth(pg, fe, client, backend); err != nil {
 					slog.Warn("relay: copy-both", "err", err)
 					release(false)
 					return
@@ -1664,7 +1664,11 @@ func isTerminalMessage(msg pgproto3.FrontendMessage) bool {
 // with per-message flush (replication is latency-sensitive, and each
 // CopyData carries a WAL record or keepalive that the peer needs
 // promptly). Errors on either side abort the pair.
-func relayCopyBoth(pg *pgproto3.Backend, fe *pgproto3.Frontend) error {
+//
+// client and backend are the sockets behind pg and fe. They are needed
+// because the two pumps can only be woken through their own
+// connections: see the drain logic after the goroutines below.
+func relayCopyBoth(pg *pgproto3.Backend, fe *pgproto3.Frontend, client, backend net.Conn) error {
 	// Channel carries a single error from whichever direction fails
 	// first. Second failure (usually the peer noticing the socket
 	// closing) is discarded — the first error is the interesting one.
@@ -1728,13 +1732,52 @@ func relayCopyBoth(pg *pgproto3.Backend, fe *pgproto3.Frontend) error {
 		}
 	}()
 
-	// First goroutine to finish decides the outcome. Drain the second
-	// so we don't leave it blocked on a dead socket (Receive will
-	// error once the peer closes, so this returns fast).
+	// First goroutine to finish decides the outcome. The second has to
+	// be drained too, or it outlives this call holding a reference to
+	// both connections.
+	//
+	// It will not always end on its own. Both pumps deliberately run
+	// without read deadlines — a walsender can idle for minutes between
+	// WAL records — so when one direction stops, the other can be
+	// parked in Receive on a socket whose peer has nothing left to say.
+	// Waiting for it unconditionally is what turned a client that
+	// vanished mid-replication into a permanently stuck relay: three
+	// goroutines, the backend connection and its pool slot, leaked for
+	// the life of the process.
+	//
+	// Tripping the read deadlines is what unparks it. SetReadDeadline
+	// is safe to call concurrently with a Read already in flight, and a
+	// deadline in the past fails that Read immediately.
 	first := <-errCh
-	<-errCh
+	grace := copyBothDrainGrace
+	if first != nil {
+		// One side is already broken, so relayImpl is going to discard
+		// this backend regardless. Nothing to wait politely for.
+		grace = 0
+	}
+	select {
+	case <-errCh:
+	case <-time.After(grace):
+		past := time.Now().Add(-time.Second)
+		_ = client.SetReadDeadline(past)
+		_ = backend.SetReadDeadline(past)
+		<-errCh
+		// Clear them again: on the clean path the caller keeps using
+		// both connections for the rest of the session, and a deadline
+		// left in the past would fail its very next read.
+		_ = client.SetReadDeadline(time.Time{})
+		_ = backend.SetReadDeadline(time.Time{})
+	}
 	return first
 }
+
+// copyBothDrainGrace is how long relayCopyBoth lets the second
+// direction finish on its own after the first one has ended, before
+// forcing it. The clean case needs a little room — the backend answers
+// a client's CopyDone with CopyDone + CommandComplete + RFQ, and that
+// round trip is real network time — while the failure case skips this
+// entirely. A var, not a const, so tests can shorten it.
+var copyBothDrainGrace = 5 * time.Second
 
 // relayCopyIn drives the COPY-IN sub-protocol: backend has sent
 // CopyInResponse and is now blocked waiting for the client's data
