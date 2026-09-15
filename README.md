@@ -81,7 +81,7 @@ exists. The settings worth knowing up front:
 | `admin_addr` | Admin UI and pool API. | `127.0.0.1:8081` |
 | `auth_users` | Map of user to SCRAM-SHA-256 verifier. | — |
 | `allow_insecure_trust_auth` | Accept every client without a password. | `false` |
-| `max_client_conn` | Global cap on accepted client connections. | `10000` |
+| `max_client_conn` | Global cap on accepted client connections, shared across the TCP and Unix listeners. | `10000` |
 | `query_wait_timeout` | How long a client waits for a backend. | `120s` |
 | `query_timeout` | Max runtime of a single statement. | `0` (off) |
 | `client_idle_timeout` | Close a client silent outside a transaction. | `0` (off) |

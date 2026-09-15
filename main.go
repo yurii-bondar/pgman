@@ -48,8 +48,20 @@ type runtimeOpts struct {
 	clientIdleTimeout      time.Duration
 	idleTransactionTimeout time.Duration
 	serverResetQuery       string
-	maxClientConn          int
-	metrics                *proxyMetrics // nil in tests — every observe call must nil-check first
+
+	// clientSlots is the max_client_conn semaphore: one buffered slot
+	// per admissible client connection, nil meaning unlimited.
+	//
+	// It lives here, shared, rather than being allocated inside
+	// acceptLoopWithOpts, because there is more than one accept loop —
+	// TCP and the optional Unix socket — and a per-loop semaphore made
+	// the real ceiling 2 × max_client_conn. The cap has to be a
+	// property of the process, since so are the file descriptors and
+	// the memory it is there to protect. Set it through
+	// setMaxClientConn, never by hand.
+	clientSlots chan struct{}
+
+	metrics *proxyMetrics // nil in tests — every observe call must nil-check first
 
 	// adminDatabase names the virtual DB that switches a client into
 	// PgBouncer-compatible admin SQL mode (SHOW POOLS, PAUSE, RESUME…).
@@ -111,7 +123,7 @@ func defaultRuntimeOpts() *runtimeOpts {
 // from parsed Config values. Kept separate so main() stays orchestration-
 // only and tests can build stripped-down opts without loading YAML.
 func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
-	return &runtimeOpts{
+	opts := &runtimeOpts{
 		clientLoginTimeout: cfg.ClientLoginTimeout,
 		queryWaitTimeout:   cfg.QueryWaitTimeout,
 		tcpKeepAlive:       cfg.TCPKeepAlive,
@@ -122,7 +134,6 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		idleTransactionTimeout: cfg.IdleTransactionTimeout,
 
 		serverResetQuery: cfg.ServerResetQuery,
-		maxClientConn:    cfg.MaxClientConn,
 		maxPreparedStmts: cfg.MaxPreparedStatements,
 		metrics:          metrics,
 		adminDatabase:    cfg.AdminDatabase,
@@ -133,6 +144,23 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		// callers (tests) don't accidentally enable admin SQL without
 		// providing a registry.
 	}
+	opts.setMaxClientConn(cfg.MaxClientConn)
+	return opts
+}
+
+// setMaxClientConn allocates the one semaphore every accept loop shares.
+// n <= 0 means unlimited.
+//
+// This is the only way to set the cap. Making it a method rather than a
+// plain field is what stops the previous bug from coming back: a caller
+// that assigned a number and left the semaphore to be created later,
+// per listener, got a limit that multiplied by the number of listeners.
+func (o *runtimeOpts) setMaxClientConn(n int) {
+	if n <= 0 {
+		o.clientSlots = nil
+		return
+	}
+	o.clientSlots = make(chan struct{}, n)
 }
 
 // adminUserSet turns the configured admin_users list into the lookup
@@ -575,15 +603,17 @@ func acceptLoop(listener net.Listener, router Router, authBackend AuthBackend, t
 }
 
 // acceptLoopWithOpts accepts connections until listener is closed,
-// enforcing max_client_conn via a semaphore (0 = unlimited) and tagging
-// every accepted conn with TCP keepalive when tcpKeepAlive > 0. Every
-// handleConn goroutine is tracked in wg so main can wait for in-flight
-// sessions to finish instead of cutting them off mid-transaction.
+// enforcing max_client_conn via the semaphore in opts (nil = unlimited)
+// and tagging every accepted conn with TCP keepalive when tcpKeepAlive
+// > 0. Every handleConn goroutine is tracked in wg so main can wait for
+// in-flight sessions to finish instead of cutting them off
+// mid-transaction.
+//
+// The semaphore comes from opts and is shared with every other accept
+// loop in the process: max_client_conn caps the proxy, not each
+// listener it happens to be running.
 func acceptLoopWithOpts(listener net.Listener, router Router, authBackend AuthBackend, tlsConfig *tls.Config, limiter *authLimiter, wg *sync.WaitGroup, opts *runtimeOpts) {
-	var sem chan struct{}
-	if opts.maxClientConn > 0 {
-		sem = make(chan struct{}, opts.maxClientConn)
-	}
+	sem := opts.clientSlots
 
 	for {
 		client, err := listener.Accept()

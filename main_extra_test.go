@@ -214,7 +214,7 @@ func TestAcceptLoopEnforcesMaxClientConn(t *testing.T) {
 	defer ln.Close()
 
 	opts := defaultRuntimeOpts()
-	opts.maxClientConn = 1
+	opts.setMaxClientConn(1)
 	opts.clientLoginTimeout = time.Second // ensure our long-lived probe eventually dies
 
 	var wg sync.WaitGroup
