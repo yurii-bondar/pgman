@@ -207,8 +207,12 @@ Honest list, so nobody discovers these in an incident:
   is bounded only by TCP keepalive. `config.yaml` has starting values.
 - **No write deadline on the client socket.** A client that stops
   reading can still stall a relay goroutine at the TCP level.
-- **No `max_prepared_statements`.** The per-session prepared-statement
-  cache grows until the client disconnects.
+- **`max_prepared_statements` evicts rather than refuses.** The cap
+  (default 200 per session) drops the least recently used entry instead
+  of rejecting the new statement. A client that goes past it keeps
+  working, but a Bind for an evicted name can reach a backend that never
+  saw the Parse and get `26000` back; drivers with their own statement
+  cache re-Parse through that.
 - **`SIGHUP` does not resize or re-target existing pools** — only adds
   and removes them. Changing a limit, DSN or TLS setting needs a restart.
 - **No online restart (`-R`).** This is deliberate; see `DEV_PLAN.md`

@@ -210,6 +210,19 @@ type Config struct {
 	// unset AppNameTracking (not exposed — see applyDefaults).
 	TrackExtraParameters []string `yaml:"track_extra_parameters"`
 
+	// MaxPreparedStatements caps how many named prepared statements the
+	// proxy tracks per client session, so that transaction-mode replay
+	// cannot be turned into unbounded memory growth by a client that
+	// keeps inventing statement names. Mirrors PgBouncer's key of the
+	// same name; 0 takes the default (200), negative disables the cap.
+	//
+	// Past the cap the least recently used entry is dropped. Set this
+	// at or above the statement-cache size of your driver (pgx defaults
+	// to 512) if you want replay to never miss — and budget for it:
+	// the worst case is roughly cap × average statement size ×
+	// max_client_conn.
+	MaxPreparedStatements int `yaml:"max_prepared_statements"`
+
 	// ---- Limits & timeouts (data plane) -----------------------------
 
 	// MaxClientConn caps the total concurrent client connections
@@ -390,6 +403,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxClientConn == 0 {
 		c.MaxClientConn = 10_000
+	}
+	if c.MaxPreparedStatements == 0 {
+		c.MaxPreparedStatements = defaultMaxPreparedStatements
 	}
 	if c.ClientLoginTimeout == 0 {
 		c.ClientLoginTimeout = 60 * time.Second

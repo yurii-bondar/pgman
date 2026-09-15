@@ -73,6 +73,14 @@ max_client_conn: 10000                      # cap on concurrent client conns (0 
 client_login_timeout: "60s"                 # startup+auth deadline; defends against slowloris
 query_wait_timeout: "120s"                  # max Acquire wait on saturated pool
 server_reset_query: "DISCARD ALL"           # session-state scrub between clients
+
+# Cap on named prepared statements tracked per client session. Every entry
+# holds the statement's full SQL text, and the client chooses both the names
+# and how many — so an uncapped cache is an OOM primitive. Past the cap the
+# least recently used entry is dropped; the client re-Parses on the next miss.
+# Budget roughly: cap x average statement size x max_client_conn.
+max_prepared_statements: 200                # 0 = default (200), negative = no cap
+
 tcp_keepalive: "30s"                        # detect vanished peers instead of leaking FDs
 
 # The three session timeouts. All default to 0 (disabled), matching

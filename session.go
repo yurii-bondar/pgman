@@ -97,6 +97,19 @@ type session struct {
 	// for the full protocol. Nil until the client's first Parse.
 	psCache psCache
 
+	// psLimit caps len(psCache); <= 0 means uncapped. Copied from
+	// max_prepared_statements at startup so the per-message hot path
+	// reads one int off the session instead of reaching for
+	// runtimeOpts.
+	psLimit int
+	// psClock is a monotonic counter stamped into prepStmtInfo.lastUsed
+	// to order eviction. Session-local and single-goroutine (only the
+	// relay loop touches it), so a plain uint64 needs no atomics.
+	psClock uint64
+	// psEvicted trips on the first eviction so the operator gets one
+	// warning per session rather than one per statement.
+	psEvicted bool
+
 	// listenWarned trips true after we've logged the one-shot
 	// "LISTEN in transaction pooling won't deliver NOTIFY" warning
 	// for this session. Prevents log spam when a client issues many

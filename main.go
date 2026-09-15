@@ -66,6 +66,10 @@ type runtimeOpts struct {
 	// tenant a PAUSE that takes the whole proxy down.
 	adminUsers map[string]bool
 
+	// maxPreparedStmts caps the per-session prepared-statement cache;
+	// <= 0 disables the cap. See Config.MaxPreparedStatements.
+	maxPreparedStmts int
+
 	// trackExtraParams is the whitelist of client StartupMessage
 	// RuntimeParams to replay on every new backend Acquire (transaction
 	// mode). Order matters — some GUCs depend on others being set first.
@@ -96,6 +100,10 @@ type runtimeOpts struct {
 func defaultRuntimeOpts() *runtimeOpts {
 	return &runtimeOpts{
 		healthCheckTimeout: 500 * time.Millisecond,
+		// Not zero like the other knobs: zero here would mean
+		// "uncapped", and a permissive default that reintroduces the
+		// unbounded cache is the wrong direction to be wrong in.
+		maxPreparedStmts: defaultMaxPreparedStatements,
 	}
 }
 
@@ -115,6 +123,7 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 
 		serverResetQuery: cfg.ServerResetQuery,
 		maxClientConn:    cfg.MaxClientConn,
+		maxPreparedStmts: cfg.MaxPreparedStatements,
 		metrics:          metrics,
 		adminDatabase:    cfg.AdminDatabase,
 		adminUsers:       adminUserSet(cfg.AdminUsers),
@@ -980,6 +989,7 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 		if sess.poolName == "" {
 			sess.poolName = sess.database
 		}
+		sess.psLimit = opts.maxPreparedStmts
 		sess.trackedParams = extractTrackedParams(m.Parameters, opts.trackExtraParams)
 		relay(client, pg, decision.Pool, sess, opts)
 	}
