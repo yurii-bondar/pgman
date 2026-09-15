@@ -10,8 +10,12 @@ import (
 // them a documentation bug that only shows up when somebody copies it.
 // They are also the only place a new key's example usage lives, so this
 // fails loudly when a key is renamed in Go and not in the samples.
+//
+// Only the tracked files are checked. config.local.yaml matches
+// *.local.yaml in .gitignore — it is whatever the developer running
+// this happens to have, and on a CI runner it does not exist at all.
 func TestShippedConfigsParse(t *testing.T) {
-	for _, path := range []string{"config.yaml", "config.local.yaml", "config.docker.yaml"} {
+	for _, path := range []string{"config.yaml", "config.docker.yaml"} {
 		t.Run(path, func(t *testing.T) {
 			cfg, err := loadConfig(path)
 			if err != nil {
