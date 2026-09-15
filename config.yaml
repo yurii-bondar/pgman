@@ -95,28 +95,47 @@ server_reset_query: "DISCARD ALL"           # session-state scrub between client
 # can reacquire it.
 server_reset_query_skip_same_session: false
 
-# Cap on named prepared statements tracked per client session. Every entry
-# holds the statement's full SQL text, and the client chooses both the names
-# and how many — so an uncapped cache is an OOM primitive. Past the cap the
-# least recently used entry is dropped; the client re-Parses on the next miss.
-# Budget roughly: cap x average statement size x max_client_conn.
+# How many named prepared statements stay prepared on one backend connection,
+# as an LRU — the same meaning the setting has in PgBouncer. Past the cap the
+# least recently used statement is closed on that backend and re-prepared from
+# the session's own record the next time it is used, so nothing is lost.
+#
+# Budget it against Postgres' plan cache: cap x average statement size, per
+# pooled connection. Setting it at or above your driver's statement-cache size
+# (pgx defaults to 512) means the steady state never re-prepares anything.
+#
+# A session may hold 4x this many statements at once; a client past that is
+# disconnected with SQLSTATE 54000, because a session with thousands of live
+# statement names is leaking them rather than caching them.
 max_prepared_statements: 200                # 0 = default (200), negative = no cap
 
 tcp_keepalive: "30s"                        # detect vanished peers instead of leaking FDs
 
-# The three session timeouts. All default to 0 (disabled), matching
-# PgBouncer and Postgres — enabling them is a workload decision, and the
-# values below are a starting point, not a recommendation.
-#
-# Leaving all three at 0 means a hung peer is bounded only by TCP
-# keepalive, i.e. by the OS, i.e. potentially for hours.
-query_timeout: "60s"                        # max time one statement may run; 0 = unlimited.
+# How long a SCRAM pass-through pool may sit unused before it is closed.
+# These pools cannot be declared here — one is created per role the first
+# time that role connects — so without a ceiling a long-lived process ends up
+# holding a pool, its connections and a reaper goroutine for every role that
+# has ever connected, including roles since dropped from the cluster.
+# Reclaiming one costs that role a single dial when it comes back.
+scram_passthrough_idle_timeout: "30m"       # 0 = default (30m), negative = keep forever
+
+# The four ways a client can hold a backend without doing work, and the
+# ceiling on each. Unset takes a generous default (15m / 30m / 5m / 60s) that
+# bounds a leak without policing normal traffic; the tighter values below are
+# a starting point for a workload you know. A negative value disables one
+# explicitly, which is the honest way to say "no ceiling" — an unset field
+# cannot be told apart from a zero one in YAML.
+query_timeout: "60s"                        # max time one statement may run; negative = unlimited.
                                             #   Does NOT apply to COPY or replication streams.
                                             #   Raise it if you run long reports through the proxy.
 client_idle_timeout: "30m"                  # close a client that is connected but silent outside a transaction
 idle_transaction_timeout: "5m"              # close a client idle *inside* an open transaction.
                                             #   The dangerous one: such a client pins a backend
                                             #   AND holds its locks and snapshot.
+client_write_timeout: "60s"                 # max time one write towards a client may block.
+                                            #   Without it a peer that stopped reading parks the
+                                            #   relay goroutine — and its backend — in write(2)
+                                            #   until TCP gives up, which is minutes.
 
 # ---- Backend failure handling ----------------------------------------------
 

@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/yurii-bondar/pgman/pool"
 )
@@ -45,6 +48,13 @@ type registryEntry struct {
 	passthrough bool
 	pool        *pool.Pool
 	dnsStop     func() // no-op if DNS watching is disabled
+
+	// lastRouted is when a session was last routed to this entry, in
+	// Unix nanoseconds. Only pass-through entries are stamped, because
+	// they are the only ones that can be reclaimed: everything else is
+	// declared in the config file and exists whether it is busy or not.
+	// Atomic because Resolve stamps it while holding only a read lock.
+	lastRouted atomic.Int64
 }
 
 // PoolRegistry is the live, mutable set of pools. Sessions capture
@@ -129,7 +139,7 @@ func (r *PoolRegistry) addEntries(name string, cfg PoolConfig) {
 func (r *PoolRegistry) newEntry(name, backendUser string, cfg PoolConfig, passthrough bool) *registryEntry {
 	key := poolKey(name, backendUser)
 	p := r.newPool(key, cfg, r.dialerFor(cfg, backendUser, passthrough))
-	return &registryEntry{
+	e := &registryEntry{
 		poolName:    name,
 		backendUser: backendUser,
 		config:      cfg,
@@ -137,6 +147,12 @@ func (r *PoolRegistry) newEntry(name, backendUser string, cfg PoolConfig, passth
 		pool:        p,
 		dnsStop:     r.startDNSWatcherFor(key, cfg, p),
 	}
+	// A pass-through entry is created because a session is being routed
+	// to it right now, so it starts its idle clock as used rather than
+	// at the zero time — otherwise the reaper could collect it before
+	// that first session ever opens a connection.
+	e.lastRouted.Store(time.Now().UnixNano())
+	return e
 }
 
 // dialerFor picks how an entry opens backend connections: with the
@@ -177,6 +193,9 @@ func (r *PoolRegistry) Resolve(database, user string) (key string, p *pool.Pool,
 	r.mu.RUnlock()
 
 	if exists {
+		if e.passthrough {
+			e.lastRouted.Store(time.Now().UnixNano())
+		}
 		return poolKey(name, backendUser), e.pool, e.config, true
 	}
 	// The only way to miss is a pass-through user seen for the first
@@ -212,10 +231,11 @@ func (r *PoolRegistry) backendIdentityFor(cfg PoolConfig, user string) (backendU
 }
 
 // createPassthroughEntry builds a per-user pass-through pool on first
-// use. Pools are never evicted afterwards, which is bounded because
-// only a client that completed a SCRAM handshake can cause one: the set
-// of pools is the set of real roles that have connected, not anything a
-// caller can inflate.
+// use, because the credential it dials with does not exist until that
+// user authenticates. Idle ones are reclaimed later by
+// EvictIdlePassthrough — the set of roles that have ever connected is
+// not the set that is still connecting, and a long-lived process would
+// otherwise accumulate a pool, and a reaper goroutine, per former user.
 func (r *PoolRegistry) createPassthroughEntry(name, user string, cfg PoolConfig) (string, *pool.Pool, PoolConfig, bool) {
 	key := poolKey(name, user)
 
@@ -374,7 +394,51 @@ func (r *PoolRegistry) Names() []string {
 	return names
 }
 
+// PoolNames returns the configured pool names, sorted and without the
+// per-identity duplicates Names reports.
+//
+// The distinction matters to anything that compares the live registry
+// against the config file: a pool with backend_users occupies several
+// registry keys ("shop", "shop/alice") but exactly one key in the
+// file's `pools:` map. Diffing against Names makes every per-user pool
+// look like a pool that is running but no longer configured, which is
+// how a reload ends up trying to remove pools nobody asked it to.
+func (r *PoolRegistry) PoolNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]struct{}, len(r.entries))
+	names := make([]string, 0, len(r.entries))
+	for _, e := range r.entries {
+		if _, dup := seen[e.poolName]; dup {
+			continue
+		}
+		seen[e.poolName] = struct{}{}
+		names = append(names, e.poolName)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (r *PoolRegistry) Add(name string, cfg PoolConfig) error {
+	if err := validatePoolConfig(name, cfg); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.entries[poolKey(name, "")]; exists {
+		return fmt.Errorf("pool %q already exists", name)
+	}
+	r.addEntries(name, cfg)
+	return nil
+}
+
+// validatePoolConfig is the check every path that creates or replaces a
+// pool shares. Add and Reconfigure are both reachable from surfaces
+// that are not a reviewed config file — an HTTP form, a file a
+// configmap-reloader just rewrote — so neither can assume the values
+// have been looked at by a human.
+func validatePoolConfig(name string, cfg PoolConfig) error {
 	if name == "" {
 		return fmt.Errorf("pool name is required")
 	}
@@ -387,20 +451,119 @@ func (r *PoolRegistry) Add(name string, cfg PoolConfig) error {
 	if cfg.Limit <= 0 {
 		return fmt.Errorf("limit must be positive, got %d", cfg.Limit)
 	}
-	// Add is the admin-API entry point, so the address arrives from an
-	// HTTP form rather than from a reviewed config file. See
-	// validateBackendAddr for what that allows if left unchecked.
-	if err := validateBackendAddr(cfg.BackendAddr); err != nil {
-		return err
+	// See validateBackendAddr for what an unchecked operator-supplied
+	// address buys an attacker.
+	return validateBackendAddr(cfg.BackendAddr)
+}
+
+// Reconfigure replaces every identity serving name with pools built
+// from cfg, and reports whether anything actually changed. Returns the
+// replaced pools so the caller can drain them in the background.
+//
+// This is how a reload applies a changed limit, DSN, TLS setting or
+// backend_users map to a pool that already exists. It is a replace
+// rather than an in-place mutation for the same reason Resize is: a
+// pool's dialer, limit and DNS watcher are fixed at construction, and a
+// live pool whose backend address changed underneath it would keep
+// handing out connections to the old host.
+//
+// Sessions already routed to the old pools keep using them — they hold
+// the *pool.Pool directly — so in-flight transactions finish against
+// the backend they started on and only new sessions see the new
+// configuration. That is the same contract Resize and Remove have.
+func (r *PoolRegistry) Reconfigure(name string, cfg PoolConfig) ([]*pool.Pool, bool, error) {
+	if err := validatePoolConfig(name, cfg); err != nil {
+		return nil, false, err
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.entries[poolKey(name, "")]; exists {
-		return fmt.Errorf("pool %q already exists", name)
+
+	base, ok := r.entries[poolKey(name, "")]
+	if !ok {
+		return nil, false, fmt.Errorf("pool %q not found", name)
+	}
+	if poolConfigEqual(base.config, cfg) {
+		return nil, false, nil
+	}
+
+	// Stop the watchers before the swap: each closes over the old pool
+	// pointer and would Reconnect one that is on its way out.
+	old := r.takeEntries(name)
+	pools := make([]*pool.Pool, 0, len(old))
+	for _, e := range old {
+		if e.dnsStop != nil {
+			e.dnsStop()
+		}
+		pools = append(pools, e.pool)
 	}
 	r.addEntries(name, cfg)
-	return nil
+	return pools, true, nil
+}
+
+// poolConfigEqual reports whether two pool configurations describe the
+// same pool. Compared field-by-field via reflection rather than with
+// == because PoolConfig carries a map and two slices; the cost is
+// irrelevant at reload frequency, and the alternative — a hand-written
+// comparison — is a function that silently stops noticing whichever
+// field gets added next.
+func poolConfigEqual(a, b PoolConfig) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+// EvictIdlePassthrough closes pass-through pools that no session has
+// been routed to for idleFor, and returns the keys it took out together
+// with the pools to drain.
+//
+// Three conditions must hold before an entry is taken, and each one
+// closes a different way this could break a working session:
+//
+//   - nothing routed to it for idleFor — the pool is not in use;
+//   - no live session names it (active) — a session between
+//     transactions holds no connection but still holds this pool
+//     pointer, and its next Acquire would fail on a closed pool;
+//   - zero connections in use — belt and braces for a session that
+//     exists without being registered, which is the shape every test
+//     harness has.
+//
+// Configured pools are never touched. They exist because an operator
+// declared them, and an idle declared pool is not garbage.
+func (r *PoolRegistry) EvictIdlePassthrough(idleFor time.Duration, active map[string]bool) ([]string, []*pool.Pool) {
+	if idleFor <= 0 {
+		return nil, nil
+	}
+	cutoff := time.Now().Add(-idleFor).UnixNano()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	evicted := make(map[string]*pool.Pool)
+	for key, e := range r.entries {
+		if !e.passthrough || active[key] || e.lastRouted.Load() > cutoff {
+			continue
+		}
+		if e.pool.Stats().InUse > 0 {
+			continue
+		}
+		if e.dnsStop != nil {
+			e.dnsStop()
+		}
+		delete(r.entries, key)
+		evicted[key] = e.pool
+	}
+	if len(evicted) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(evicted))
+	for key := range evicted {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	pools := make([]*pool.Pool, 0, len(evicted))
+	for _, key := range keys {
+		pools = append(pools, evicted[key])
+	}
+	return keys, pools
 }
 
 // Configs returns each pool's originating configuration (current Limit

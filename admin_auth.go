@@ -33,7 +33,7 @@ import (
 //     short-circuits a stolen-hash offline attack.
 //
 // If none of the three is configured, the middleware serves only
-// loopback callers — the safe "dev" default from DEV_PLAN.
+// loopback callers — the safe default for a dev machine.
 //
 // CSRF (Origin/Referer strict same-host match on non-safe methods)
 // runs unconditionally. Even a valid mTLS identity or OIDC token

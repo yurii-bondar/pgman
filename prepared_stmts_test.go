@@ -49,6 +49,19 @@ func newPSFixture(t *testing.T) *psFixture {
 	return f
 }
 
+// process drives one client message through the same interception path
+// the relay loop uses. The error return is for a session that cannot be
+// served any more, which none of these tests provokes — see
+// prepared_stmts_limit_test.go for the one that does.
+func (f *psFixture) process(msg pgproto3.FrontendMessage) (pgproto3.FrontendMessage, psSwallow) {
+	f.t.Helper()
+	out, swallow, err := processClientMsg(f.fe, f.backend, f.sess, msg)
+	if err != nil {
+		f.t.Fatalf("processClientMsg(%T): %v", msg, err)
+	}
+	return out, swallow
+}
+
 // flushAndCollect sends whatever is buffered and returns the Parse
 // messages the backend saw, in order.
 func (f *psFixture) flushAndCollect(want int) []*pgproto3.Parse {
@@ -75,13 +88,13 @@ func TestParseRecordsStatementForReplay(t *testing.T) {
 	f := newPSFixture(t)
 
 	parse := &pgproto3.Parse{Name: "s1", Query: "SELECT $1::int", ParameterOIDs: []uint32{23}}
-	out, swallow := processClientMsg(f.fe, f.backend, f.sess, parse)
+	out, swallow := f.process(parse)
 
 	if out != pgproto3.FrontendMessage(parse) {
 		t.Error("Parse must be forwarded unchanged")
 	}
-	if swallow != 0 {
-		t.Errorf("swallow = %d, want 0: the client sent this Parse itself", swallow)
+	if swallow.parseComplete != 0 {
+		t.Errorf("swallow = %d, want 0: the client sent this Parse itself", swallow.parseComplete)
 	}
 	info, ok := f.sess.psCache["s1"]
 	if !ok {
@@ -105,7 +118,7 @@ func TestParseRecordsStatementForReplay(t *testing.T) {
 func TestUnnamedParseIsNotCached(t *testing.T) {
 	f := newPSFixture(t)
 
-	processClientMsg(f.fe, f.backend, f.sess, &pgproto3.Parse{Name: "", Query: "SELECT 1"})
+	f.process(&pgproto3.Parse{Name: "", Query: "SELECT 1"})
 
 	if len(f.sess.psCache) != 0 {
 		t.Error("the unnamed statement is single-use and must not be cached")
@@ -123,12 +136,12 @@ func TestBindOnColdBackendPrependsParse(t *testing.T) {
 	f.sess.psCache = psCache{"s1": {SQL: "SELECT $1::int", ParameterOIDs: []uint32{23}}}
 
 	bind := &pgproto3.Bind{PreparedStatement: "s1"}
-	out, swallow := processClientMsg(f.fe, f.backend, f.sess, bind)
+	out, swallow := f.process(bind)
 	f.fe.Send(out)
 
-	if swallow != 1 {
+	if swallow.parseComplete != 1 {
 		t.Fatalf("swallow = %d, want 1: the synthetic Parse produces a ParseComplete "+
-			"the client never asked for and must not see", swallow)
+			"the client never asked for and must not see", swallow.parseComplete)
 	}
 
 	parses := f.flushAndCollect(1)
@@ -146,11 +159,11 @@ func TestBindOnColdBackendPrependsParse(t *testing.T) {
 func TestBindOnWarmBackendDoesNotPrepend(t *testing.T) {
 	f := newPSFixture(t)
 	f.sess.psCache = psCache{"s1": {SQL: "SELECT 1"}}
-	f.backend.preparedStmts = backendPSCache{"s1": struct{}{}}
+	f.backend.preparedStmts = backendPSCache{"s1": 1}
 
-	_, swallow := processClientMsg(f.fe, f.backend, f.sess, &pgproto3.Bind{PreparedStatement: "s1"})
-	if swallow != 0 {
-		t.Errorf("swallow = %d, want 0: the backend already has this statement", swallow)
+	_, swallow := f.process(&pgproto3.Bind{PreparedStatement: "s1"})
+	if swallow.parseComplete != 0 {
+		t.Errorf("swallow = %d, want 0: the backend already has this statement", swallow.parseComplete)
 	}
 }
 
@@ -159,9 +172,9 @@ func TestBindForUnknownStatementIsForwardedAsIs(t *testing.T) {
 
 	// No Parse was ever seen for "ghost" — forwarding it unchanged lets
 	// the backend produce the authoritative error.
-	_, swallow := processClientMsg(f.fe, f.backend, f.sess, &pgproto3.Bind{PreparedStatement: "ghost"})
-	if swallow != 0 {
-		t.Errorf("swallow = %d, want 0", swallow)
+	_, swallow := f.process(&pgproto3.Bind{PreparedStatement: "ghost"})
+	if swallow.parseComplete != 0 {
+		t.Errorf("swallow = %d, want 0", swallow.parseComplete)
 	}
 }
 
@@ -170,19 +183,17 @@ func TestDescribeStatementReplaysButPortalDoesNot(t *testing.T) {
 	f.sess.psCache = psCache{"s1": {SQL: "SELECT 1"}}
 
 	// 'S' — describe by statement name, needs the statement to exist.
-	_, swallow := processClientMsg(f.fe, f.backend, f.sess,
-		&pgproto3.Describe{ObjectType: 'S', Name: "s1"})
-	if swallow != 1 {
-		t.Errorf("Describe('S') swallow = %d, want 1", swallow)
+	_, swallow := f.process(&pgproto3.Describe{ObjectType: 'S', Name: "s1"})
+	if swallow.parseComplete != 1 {
+		t.Errorf("Describe('S') swallow = %d, want 1", swallow.parseComplete)
 	}
 
 	// 'P' — describe by portal. Portals are per-transaction and are
 	// never replayed.
 	f.backend.preparedStmts = nil
-	_, swallow = processClientMsg(f.fe, f.backend, f.sess,
-		&pgproto3.Describe{ObjectType: 'P', Name: "s1"})
-	if swallow != 0 {
-		t.Errorf("Describe('P') swallow = %d, want 0", swallow)
+	_, swallow = f.process(&pgproto3.Describe{ObjectType: 'P', Name: "s1"})
+	if swallow.parseComplete != 0 {
+		t.Errorf("Describe('P') swallow = %d, want 0", swallow.parseComplete)
 	}
 }
 
@@ -192,9 +203,9 @@ func TestDescribeStatementReplaysButPortalDoesNot(t *testing.T) {
 func TestCloseDropsStatementFromBothCaches(t *testing.T) {
 	f := newPSFixture(t)
 	f.sess.psCache = psCache{"s1": {SQL: "SELECT 1"}}
-	f.backend.preparedStmts = backendPSCache{"s1": struct{}{}}
+	f.backend.preparedStmts = backendPSCache{"s1": 1}
 
-	processClientMsg(f.fe, f.backend, f.sess, &pgproto3.Close{ObjectType: 'S', Name: "s1"})
+	f.process(&pgproto3.Close{ObjectType: 'S', Name: "s1"})
 
 	if _, still := f.sess.psCache["s1"]; still {
 		t.Error("Close left the statement in the session cache")
@@ -218,9 +229,9 @@ func TestDDLInvalidatesCaches(t *testing.T) {
 		t.Run(sql, func(t *testing.T) {
 			f := newPSFixture(t)
 			f.sess.psCache = psCache{"s1": {SQL: "SELECT * FROM users"}}
-			f.backend.preparedStmts = backendPSCache{"s1": struct{}{}}
+			f.backend.preparedStmts = backendPSCache{"s1": 1}
 
-			processClientMsg(f.fe, f.backend, f.sess, &pgproto3.Query{String: sql})
+			f.process(&pgproto3.Query{String: sql})
 
 			if f.sess.psCache != nil {
 				t.Error("session prepared-statement cache survived a DDL")
@@ -243,9 +254,9 @@ func TestNonDDLLeavesCachesIntact(t *testing.T) {
 		t.Run(sql, func(t *testing.T) {
 			f := newPSFixture(t)
 			f.sess.psCache = psCache{"s1": {SQL: "SELECT 1"}}
-			f.backend.preparedStmts = backendPSCache{"s1": struct{}{}}
+			f.backend.preparedStmts = backendPSCache{"s1": 1}
 
-			processClientMsg(f.fe, f.backend, f.sess, &pgproto3.Query{String: sql})
+			f.process(&pgproto3.Query{String: sql})
 
 			if f.sess.psCache == nil {
 				t.Errorf("%q was misdetected as DDL and flushed the cache", sql)
@@ -286,7 +297,7 @@ func TestIsDDLKeywordDetection(t *testing.T) {
 // that still claims otherwise would suppress the replay and produce the
 // exact "does not exist" error this machinery prevents.
 func TestClearBackendPSCacheAfterReset(t *testing.T) {
-	b := &backendConn{preparedStmts: backendPSCache{"s1": struct{}{}}}
+	b := &backendConn{preparedStmts: backendPSCache{"s1": 1}}
 	clearBackendPSCache(b)
 	if b.preparedStmts != nil {
 		t.Error("clearBackendPSCache left entries behind")
@@ -303,12 +314,12 @@ func TestProcessClientMsgPassesThroughHotPathMessages(t *testing.T) {
 		&pgproto3.Execute{}, &pgproto3.Sync{}, &pgproto3.Flush{},
 		&pgproto3.CopyData{}, &pgproto3.CopyDone{}, &pgproto3.Terminate{},
 	} {
-		out, swallow := processClientMsg(f.fe, f.backend, f.sess, msg)
+		out, swallow := f.process(msg)
 		if out != msg {
 			t.Errorf("%T was not passed through unchanged", msg)
 		}
-		if swallow != 0 {
-			t.Errorf("%T produced swallow = %d, want 0", msg, swallow)
+		if swallow.parseComplete != 0 {
+			t.Errorf("%T produced swallow = %d, want 0", msg, swallow.parseComplete)
 		}
 	}
 }
@@ -317,16 +328,16 @@ func TestEnsureBackendHasStmtHandlesNilInputs(t *testing.T) {
 	f := newPSFixture(t)
 
 	// No session cache yet — nothing to replay from.
-	if _, swallow := ensureBackendHasStmt(f.fe, f.backend, f.sess, "s1", &pgproto3.Bind{}); swallow != 0 {
+	if swallow := ensureBackendHasStmt(f.fe, f.backend, f.sess, "s1"); swallow.parseComplete != 0 {
 		t.Error("replay attempted with an empty session cache")
 	}
 	// Empty name refers to the unnamed statement or a portal.
 	f.sess.psCache = psCache{"s1": {SQL: "SELECT 1"}}
-	if _, swallow := ensureBackendHasStmt(f.fe, f.backend, f.sess, "", &pgproto3.Bind{}); swallow != 0 {
+	if swallow := ensureBackendHasStmt(f.fe, f.backend, f.sess, ""); swallow.parseComplete != 0 {
 		t.Error("replay attempted for an empty statement name")
 	}
 	// No backend held (between transactions).
-	if _, swallow := ensureBackendHasStmt(f.fe, nil, f.sess, "s1", &pgproto3.Bind{}); swallow != 0 {
+	if swallow := ensureBackendHasStmt(f.fe, nil, f.sess, "s1"); swallow.parseComplete != 0 {
 		t.Error("replay attempted without a backend")
 	}
 }

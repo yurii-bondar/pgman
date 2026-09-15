@@ -47,7 +47,11 @@ type runtimeOpts struct {
 	queryTimeout           time.Duration
 	clientIdleTimeout      time.Duration
 	idleTransactionTimeout time.Duration
-	serverResetQuery       string
+	// clientWriteTimeout bounds a single write towards a client, so a
+	// peer that has stopped reading cannot park a relay goroutine — and
+	// the backend it holds — inside write(2). See client_write.go.
+	clientWriteTimeout time.Duration
+	serverResetQuery   string
 	// resetSkipSameSession skips the scrub when the same session
 	// reacquires the connection. See
 	// Config.ServerResetQuerySkipSameSession.
@@ -136,6 +140,7 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		queryTimeout:           cfg.QueryTimeout,
 		clientIdleTimeout:      cfg.ClientIdleTimeout,
 		idleTransactionTimeout: cfg.IdleTransactionTimeout,
+		clientWriteTimeout:     cfg.ClientWriteTimeout,
 
 		serverResetQuery:     cfg.ServerResetQuery,
 		resetSkipSameSession: cfg.ServerResetQuerySkipSameSession,
@@ -244,6 +249,11 @@ func main() {
 		return metrics.observeAcquire(name)
 	})
 	poolRegistry.SetClientKeyStore(keyStore)
+	// Only pass-through deployments create pools on demand, so only
+	// they need something to take them back.
+	if keyStore != nil {
+		defer startPassthroughReaper(poolRegistry, cfg.ScramPassthroughIdleTimeout)()
+	}
 	promRegistry.MustRegister(newPoolsCollector(poolRegistry))
 	// pgbouncer_exporter-compatible aliases: same underlying stats,
 	// PgBouncer-named metrics so Grafana dashboards work unchanged.
@@ -375,6 +385,7 @@ func main() {
 			slog.Info("SIGHUP reload applied",
 				"added", result.Added,
 				"removed", result.Removed,
+				"reconfigured", result.Reconfigured,
 				"unchanged", result.Unchanged)
 		}
 	}()
@@ -871,13 +882,13 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 		_ = client.SetDeadline(time.Now().Add(opts.clientLoginTimeout))
 	}
 
-	pg := pgproto3.NewBackend(client, client)
+	pg := pgproto3.NewBackend(client, newClientWriter(client, opts.clientWriteTimeout))
 
 	// Don't overwrite client on error — receiveStartupMessage returns
 	// a nil conn on failure, and the outer `defer client.Close()` would
 	// then panic on a nil-interface call. Reassign only on success,
 	// which also handles the SSL upgrade path (client → *tls.Conn).
-	msg, upgradedClient, upgradedPG, err := receiveStartupMessage(pg, client, tlsConfig)
+	msg, upgradedClient, upgradedPG, err := receiveStartupMessage(pg, client, tlsConfig, opts.clientWriteTimeout)
 	if err != nil {
 		slog.Info("startup: aborted", "err", err)
 		if opts.metrics != nil {
@@ -1078,7 +1089,13 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 // receiveStartupMessage reads until StartupMessage or CancelRequest.
 // On SSLRequest with tls configured, performs the TLS handshake in
 // place and returns the upgraded connection.
-func receiveStartupMessage(pg *pgproto3.Backend, client net.Conn, tlsConfig *tls.Config) (msg pgproto3.FrontendMessage, conn net.Conn, out *pgproto3.Backend, err error) {
+//
+// writeTimeout is the client_write_timeout the returned Backend must
+// write under; it has to be passed in rather than read from a global
+// because the TLS branch builds a second Backend over the upgraded
+// connection, and a Backend built without the bound would leave every
+// TLS session's writes unbounded.
+func receiveStartupMessage(pg *pgproto3.Backend, client net.Conn, tlsConfig *tls.Config, writeTimeout time.Duration) (msg pgproto3.FrontendMessage, conn net.Conn, out *pgproto3.Backend, err error) {
 	conn, out = client, pg
 	for {
 		m, err := out.ReceiveStartupMessage()
@@ -1105,7 +1122,7 @@ func receiveStartupMessage(pg *pgproto3.Backend, client net.Conn, tlsConfig *tls
 				return nil, nil, nil, fmt.Errorf("tls handshake: %w", err)
 			}
 			conn = tlsConn
-			out = pgproto3.NewBackend(conn, conn)
+			out = pgproto3.NewBackend(conn, newClientWriter(conn, writeTimeout))
 
 		case *pgproto3.GSSEncRequest:
 			if _, err := conn.Write([]byte{'N'}); err != nil {
@@ -1404,17 +1421,35 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 		// Simple query protocol: a single Query message triggers an
 		// immediate response ending with RFQ — treated as terminal.
 		//
-		// Prepared-statement replay: interceptClientMsg may prepend a
-		// Parse for a stmt this backend doesn't yet know. Each such
-		// prepend emits an extra ParseComplete from the backend that
-		// the client didn't ask for — swallowParseComplete counts how
-		// many we owe the client (i.e. must drop before forwarding).
+		// Prepared-statement replay: processClientMsg may prepend a
+		// Parse for a stmt this backend doesn't yet know, and a Close
+		// for the one it evicts to make room. Each injected message
+		// emits an ack the client never asked for, so the counts say
+		// how many of each to drop out of the response stream.
 		// Fused per-message intercept: PS lazy-replay + LISTEN warn +
 		// DDL cache flush in one type switch. Hot Bind/Execute/Sync
 		// loop hits the "nothing to do" branch for 2 of every 3 msgs.
-		var swallowParseComplete int
-		outMsg, swallow := processClientMsg(fe, backend, sess, msg)
-		swallowParseComplete += swallow
+		var swallow psSwallow
+		outMsg, injected, err := processClientMsg(fe, backend, sess, msg)
+		if err != nil {
+			// The only error this returns is a session that cannot be
+			// served correctly any more. 54000 (program_limit_exceeded)
+			// is what Postgres itself uses for "you asked for more than
+			// this server will hold".
+			slog.Warn("relay: prepared-statement ceiling",
+				"err", err, "user", sess.user, "database", sess.database)
+			pg.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "54000",
+				Message:  err.Error(),
+			})
+			_ = pg.Flush()
+			// The backend never saw this Parse, so it is still clean
+			// unless a transaction is open on it.
+			release(lastTxStatus == 'I')
+			return
+		}
+		swallow.add(injected)
 		fe.Send(outMsg)
 
 		terminal := isTerminalMessage(msg)
@@ -1435,8 +1470,22 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 				release(backend != nil && lastTxStatus == 'I')
 				return
 			}
-			outNext, swallowN := processClientMsg(fe, backend, sess, next)
-			swallowParseComplete += swallowN
+			outNext, injectedNext, err := processClientMsg(fe, backend, sess, next)
+			if err != nil {
+				slog.Warn("relay: prepared-statement ceiling",
+					"err", err, "user", sess.user, "database", sess.database)
+				pg.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Code:     "54000",
+					Message:  err.Error(),
+				})
+				_ = pg.Flush()
+				// Mid-batch: whatever of this batch already reached the
+				// backend leaves it in a state nobody else may inherit.
+				release(false)
+				return
+			}
+			swallow.add(injectedNext)
 			fe.Send(outNext)
 			terminal = isTerminalMessage(next)
 		}
@@ -1482,12 +1531,19 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 				release(false)
 				return
 			}
-			// Swallow ParseCompletes generated by our lazy-prepare
-			// prepends — the client didn't send those Parses and
-			// isn't expecting matching ParseComplete acks.
-			if swallowParseComplete > 0 {
+			// Swallow the acks for messages the proxy injected: the
+			// ParseComplete of a lazy-prepare prepend, and the
+			// CloseComplete of the eviction that made room for it. The
+			// client sent neither and is not expecting either.
+			if swallow.parseComplete > 0 {
 				if _, ok := reply.(*pgproto3.ParseComplete); ok {
-					swallowParseComplete--
+					swallow.parseComplete--
+					continue
+				}
+			}
+			if swallow.closeComplete > 0 {
+				if _, ok := reply.(*pgproto3.CloseComplete); ok {
+					swallow.closeComplete--
 					continue
 				}
 			}

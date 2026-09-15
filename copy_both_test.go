@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -155,20 +156,28 @@ func TestCopyBothCompletesNormally(t *testing.T) {
 
 	// Consume what the proxy relays back so the backend→client pump
 	// reaches its RFQ exit rather than blocking on an unread pipe.
-	relayed := make(chan pgproto3.BackendMessage, 8)
+	//
+	// The client reports through a channel instead of the test polling
+	// a buffered one: relayCopyBoth returns as soon as it has forwarded
+	// the RFQ, which is before this goroutine has necessarily read it,
+	// so a `len(ch) > 0` check here raced the pump and failed roughly
+	// one run in four.
+	clientDone := make(chan error, 1)
 	go func() {
 		fe := pgproto3.NewFrontend(rig.clientPeer, rig.clientPeer)
 		fe.Send(&pgproto3.CopyDone{})
 		if err := fe.Flush(); err != nil {
+			clientDone <- fmt.Errorf("send CopyDone: %w", err)
 			return
 		}
 		for {
 			msg, err := fe.Receive()
 			if err != nil {
+				clientDone <- fmt.Errorf("the stream ended before ReadyForQuery: %w", err)
 				return
 			}
-			relayed <- cloneBackendMessage(msg)
 			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				clientDone <- nil
 				return
 			}
 		}
@@ -178,13 +187,12 @@ func TestCopyBothCompletesNormally(t *testing.T) {
 		t.Fatalf("a clean CopyBoth exchange reported %v", err)
 	}
 
-	var sawRFQ bool
-	for len(relayed) > 0 {
-		if _, ok := (<-relayed).(*pgproto3.ReadyForQuery); ok {
-			sawRFQ = true
+	select {
+	case err := <-clientDone:
+		if err != nil {
+			t.Errorf("the backend's ReadyForQuery never reached the client: %v", err)
 		}
-	}
-	if !sawRFQ {
-		t.Error("the backend's ReadyForQuery never reached the client")
+	case <-time.After(2 * time.Second):
+		t.Error("the client is still waiting for the backend's ReadyForQuery")
 	}
 }

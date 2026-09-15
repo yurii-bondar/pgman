@@ -117,7 +117,7 @@ func indexHandler(registry *PoolRegistry, eventLog *EventLog) http.HandlerFunc {
 // sseHandler streams three htmx SSE events — "pools", "sessions", "events"
 // — each targeting its own div. Closing the browser tab cancels
 // r.Context(); the select below sees that and the goroutine returns,
-// exactly the lifecycle DEV_PLAN calls for: no explicit unsubscribe
+// exactly the lifecycle this wants: no explicit unsubscribe
 // needed, no goroutine leak. This never renders ManagePanel — the
 // management controls live outside this refresh cycle on purpose (see
 // ManagePanel's own doc comment: an in-progress resize edit must not be
@@ -360,7 +360,10 @@ func reloadHandler(configPath string, registry *PoolRegistry) http.HandlerFunc {
 			return
 		}
 
-		current := registry.Names()
+		// Pool names rather than registry keys, so a pool split by
+		// backend_users isn't reported as several pools that the file
+		// has never heard of.
+		current := registry.PoolNames()
 		currentSet := make(map[string]bool, len(current))
 		for _, name := range current {
 			currentSet[name] = true
@@ -370,10 +373,17 @@ func reloadHandler(configPath string, registry *PoolRegistry) http.HandlerFunc {
 			fileSet[name] = true
 		}
 
-		var added, removed []string
-		for name := range cfg.Pools {
+		var added, removed, changed []string
+		for name, pc := range cfg.Pools {
 			if !currentSet[name] {
 				added = append(added, name)
+				continue
+			}
+			// Same comparison the reload itself makes, so the preview
+			// cannot claim a pool is unchanged and then have SIGHUP
+			// replace it.
+			if live, ok := registry.PoolConfig(name); ok && !poolConfigEqual(live, pc) {
+				changed = append(changed, name)
 			}
 		}
 		for _, name := range current {
@@ -383,12 +393,14 @@ func reloadHandler(configPath string, registry *PoolRegistry) http.HandlerFunc {
 		}
 		sort.Strings(added)
 		sort.Strings(removed)
+		sort.Strings(changed)
 
 		lines := []string{
 			"config valid.",
 			fmt.Sprintf("in file but not running: %v", added),
 			fmt.Sprintf("running but not in file: %v", removed),
-			"not applied automatically — use the pool controls above, or restart the process.",
+			fmt.Sprintf("running with a different config: %v", changed),
+			"not applied automatically — send SIGHUP to apply, or use the pool controls above.",
 		}
 		if err := web.ReloadResult(lines, false).Render(r.Context(), w); err != nil {
 			slog.Warn("ui: render reload result", "err", err)

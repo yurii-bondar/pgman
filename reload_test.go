@@ -50,8 +50,13 @@ func TestApplyConfigReloadAddsAndRemovesPools(t *testing.T) {
 	if !slices.Equal(result.Removed, []string{"gone"}) {
 		t.Errorf("Removed = %v, want [gone]", result.Removed)
 	}
-	if !slices.Equal(result.Unchanged, []string{"keep"}) {
-		t.Errorf("Unchanged = %v, want [keep]", result.Unchanged)
+	// "keep" is in both, but the file's DSN and address differ from what
+	// dummyPoolConfig built, so it is reconciled rather than left as is.
+	if !slices.Equal(result.Reconfigured, []string{"keep"}) {
+		t.Errorf("Reconfigured = %v, want [keep]", result.Reconfigured)
+	}
+	if len(result.Unchanged) != 0 {
+		t.Errorf("Unchanged = %v, want empty", result.Unchanged)
 	}
 
 	if _, ok := registry.Get("fresh"); !ok {
@@ -62,19 +67,17 @@ func TestApplyConfigReloadAddsAndRemovesPools(t *testing.T) {
 	}
 }
 
-// TestApplyConfigReloadLeavesExistingPoolsAlone pins a deliberate
-// limitation, which is worth a test precisely because it surprises
-// people: SIGHUP reconciles the *set* of pools, never their settings.
-//
-// Hot-resizing or re-pointing a live pool needs the same drain care as
-// a removal, so it stays opt-in through the admin API. A test here
-// means nobody "fixes" that by accident.
-func TestApplyConfigReloadLeavesExistingPoolsAlone(t *testing.T) {
+// TestApplyConfigReloadReconfiguresChangedPools covers the half of the
+// reconciliation that used to be missing: a pool whose settings changed
+// in the file is rebuilt at the new settings, so changing a limit or
+// re-pointing a DSN no longer needs a process restart — which would
+// drop every session rather than only the ones the change affects.
+func TestApplyConfigReloadReconfiguresChangedPools(t *testing.T) {
 	original := dummyPoolConfig(2)
 	registry := NewPoolRegistry(map[string]PoolConfig{"db": original}, NewEventLog(10))
 	before, _ := registry.Get("db")
 
-	// The file says limit 2 and a different backend than dummyPoolConfig.
+	// The file points "db" at a different backend than dummyPoolConfig.
 	path := writeReloadConfig(t, "db")
 
 	result, err := applyConfigReload(path, registry)
@@ -82,16 +85,69 @@ func TestApplyConfigReloadLeavesExistingPoolsAlone(t *testing.T) {
 		t.Fatalf("applyConfigReload: %v", err)
 	}
 	if len(result.Added) != 0 || len(result.Removed) != 0 {
-		t.Fatalf("expected a no-op reload, got %+v", result)
+		t.Fatalf("a pool present in both must be neither added nor removed, got %+v", result)
+	}
+	if !slices.Equal(result.Reconfigured, []string{"db"}) {
+		t.Fatalf("Reconfigured = %v, want [db]", result.Reconfigured)
 	}
 
 	after, _ := registry.Get("db")
-	if before != after {
-		t.Error("the live pool was replaced; SIGHUP must not re-create existing pools")
+	if before == after {
+		t.Error("the pool was not replaced, so it is still dialing the old backend")
 	}
-	if got, _ := registry.PoolConfig("db"); got.BackendAddr != original.BackendAddr {
-		t.Errorf("backend_addr changed to %q; SIGHUP must not re-point a live pool",
-			got.BackendAddr)
+	got, _ := registry.PoolConfig("db")
+	if got.BackendAddr == original.BackendAddr {
+		t.Errorf("backend_addr is still %q; the file's value was not applied", got.BackendAddr)
+	}
+}
+
+// TestApplyConfigReloadLeavesIdenticalPoolsAlone is the other side of
+// the same coin. Replacing a pool whose config did not change would
+// churn every connection in it on every reload — and a configmap
+// reloader can fire a reload for a change to an unrelated key.
+func TestApplyConfigReloadLeavesIdenticalPoolsAlone(t *testing.T) {
+	path := writeReloadConfig(t, "db")
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	registry := NewPoolRegistry(cfg.Pools, NewEventLog(10))
+	before, _ := registry.Get("db")
+
+	result, err := applyConfigReload(path, registry)
+	if err != nil {
+		t.Fatalf("applyConfigReload: %v", err)
+	}
+	if !slices.Equal(result.Unchanged, []string{"db"}) {
+		t.Fatalf("Unchanged = %v, want [db]; result was %+v", result.Unchanged, result)
+	}
+	if after, _ := registry.Get("db"); before != after {
+		t.Error("a pool with an identical config was rebuilt anyway")
+	}
+}
+
+// TestApplyConfigReloadIgnoresPerIdentityKeys: a pool split by
+// backend_users occupies several registry keys but one entry in the
+// file. Diffing against the keys made every per-user pool look like a
+// pool that is running but no longer configured — so a reload would
+// try to remove pools nobody asked it to.
+func TestApplyConfigReloadIgnoresPerIdentityKeys(t *testing.T) {
+	cfg := dummyPoolConfig(2)
+	cfg.BackendUsers = map[string]string{"alice": "postgres://alice:p@localhost:5432/db"}
+	registry := NewPoolRegistry(map[string]PoolConfig{"db": cfg}, NewEventLog(10))
+
+	if _, ok := registry.Get("db/alice"); !ok {
+		t.Fatal("the per-user pool was not created, so this test proves nothing")
+	}
+
+	path := writeReloadConfig(t, "db")
+	result, err := applyConfigReload(path, registry)
+	if err != nil {
+		t.Fatalf("applyConfigReload: %v", err)
+	}
+	if len(result.Removed) != 0 {
+		t.Errorf("Removed = %v, want empty: %q is an identity of %q, not a pool of its own",
+			result.Removed, "db/alice", "db")
 	}
 }
 

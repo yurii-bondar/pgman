@@ -10,6 +10,44 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Default ceilings for the four ways a client can hold proxy resources
+// without doing work. Each is deliberately far above what a healthy
+// workload needs, because the job of a default is to bound the damage
+// from something already wrong, not to police normal traffic.
+const (
+	// defaultQueryTimeout: a statement still running after this has
+	// either found a pathological plan or is blocked on a lock nobody
+	// is going to release. The backend it pins cannot serve anyone else
+	// meanwhile, so the cost of waiting is paid by every other client
+	// of that pool.
+	defaultQueryTimeout = 15 * time.Minute
+
+	// defaultClientIdleTimeout: half an hour of silence outside a
+	// transaction. Long enough that an interactive psql left open over
+	// lunch survives, short enough that a leaked connection from an
+	// application pool does not outlive the deploy that leaked it.
+	defaultClientIdleTimeout = 30 * time.Minute
+
+	// defaultIdleTransactionTimeout is the tightest of the four,
+	// because idle-in-transaction is the most expensive idle state
+	// there is: it holds locks and pins the oldest snapshot, so vacuum
+	// stops advancing across the whole database, not just this pool.
+	defaultIdleTransactionTimeout = 5 * time.Minute
+
+	// defaultClientWriteTimeout bounds one write towards a client. It
+	// is generous because a legitimate slow reader (a client paging
+	// through a huge result set) must not be killed — this is aimed at
+	// a peer that has stopped reading altogether.
+	defaultClientWriteTimeout = 60 * time.Second
+
+	// defaultScramPassthroughIdleTimeout is how long a per-role
+	// pass-through pool survives without a session. Half an hour is
+	// well past any application's reconnect interval, so a pool is only
+	// reclaimed once that role has genuinely stopped connecting; the
+	// cost of being wrong is one extra dial when it comes back.
+	defaultScramPassthroughIdleTimeout = 30 * time.Minute
+)
+
 // Config is the top-level YAML shape. All duration fields accept Go's
 // standard time.Duration syntax ("30s", "5m", "1h").
 type Config struct {
@@ -223,6 +261,20 @@ type Config struct {
 	// max_client_conn.
 	MaxPreparedStatements int `yaml:"max_prepared_statements"`
 
+	// ScramPassthroughIdleTimeout is how long a SCRAM pass-through pool
+	// may sit unused before it is closed. Unset takes
+	// defaultScramPassthroughIdleTimeout; negative keeps every pool for
+	// the process's lifetime.
+	//
+	// Pass-through pools are created on demand, one per role that
+	// authenticates, and each brings a reaper goroutine and up to Limit
+	// connections. Keeping them forever is bounded by the role count,
+	// which sounds safe until the roles are per-tenant or per-employee:
+	// a process up for a month then holds a pool for everyone who
+	// connected during that month, including the ones who have since
+	// been dropped.
+	ScramPassthroughIdleTimeout time.Duration `yaml:"scram_passthrough_idle_timeout"`
+
 	// ---- Limits & timeouts (data plane) -----------------------------
 
 	// MaxClientConn caps the total concurrent client connections
@@ -241,9 +293,10 @@ type Config struct {
 	// aborts the query server-side) and reports the failure to the
 	// client. Mirrors PgBouncer's query_timeout.
 	//
-	// 0 disables it, matching PgBouncer — the right ceiling is entirely
-	// workload-specific and a proxy that silently kills a legitimate
-	// 20-minute report is worse than one that does nothing.
+	// Unset takes defaultQueryTimeout; a negative value disables it.
+	// PgBouncer defaults this to 0 and pgman used to copy that, which
+	// left the shipped configuration with no ceiling at all on a
+	// statement holding a pooled backend.
 	//
 	// Deliberately not applied to COPY or replication streams: those
 	// are bulk transfers whose duration says nothing about health.
@@ -251,7 +304,8 @@ type Config struct {
 
 	// ClientIdleTimeout closes a client that has been connected but
 	// silent for this long while NOT inside a transaction. Mirrors
-	// PgBouncer's client_idle_timeout. 0 disables.
+	// PgBouncer's client_idle_timeout. Unset takes
+	// defaultClientIdleTimeout; negative disables.
 	//
 	// The failure it prevents: in session pooling a silent client holds
 	// its backend for as long as the socket stays open, which — with
@@ -260,13 +314,25 @@ type Config struct {
 
 	// IdleTransactionTimeout closes a client that is sitting inside an
 	// open transaction without sending anything. Mirrors PgBouncer's
-	// idle_transaction_timeout. 0 disables.
+	// idle_transaction_timeout. Unset takes
+	// defaultIdleTransactionTimeout; negative disables.
 	//
 	// This is the more dangerous sibling of ClientIdleTimeout: an idle
 	// open transaction pins a backend *and* holds whatever locks and
 	// snapshot it has already taken, so it blocks other writers and
 	// stops vacuum from advancing.
 	IdleTransactionTimeout time.Duration `yaml:"idle_transaction_timeout"`
+
+	// ClientWriteTimeout bounds a single write towards a client socket.
+	// Unset takes defaultClientWriteTimeout; negative disables.
+	//
+	// Without it a client that stops reading — killed container, frozen
+	// VM, a laptop whose lid closed mid-result-set — fills the kernel
+	// send buffer and then parks the relay goroutine inside write(2)
+	// for as long as the TCP retransmit timer allows, which on Linux is
+	// minutes. The backend that goroutine holds is pinned for the whole
+	// time, so one dead reader costs a pool slot.
+	ClientWriteTimeout time.Duration `yaml:"client_write_timeout"`
 
 	// CircuitBreakerThreshold is how many consecutive dial failures
 	// trip a pool's breaker. While open, Acquire fails immediately
@@ -477,10 +543,36 @@ func (c *Config) applyDefaults() {
 	if c.QueryWaitTimeout == 0 {
 		c.QueryWaitTimeout = 120 * time.Second
 	}
-	// QueryTimeout / ClientIdleTimeout / IdleTransactionTimeout keep
-	// their zero value on purpose: 0 means "disabled", same as
-	// PgBouncer and same as Postgres' own statement_timeout. Enabling
-	// them by default would start severing connections on upgrade.
+	// The session timeouts below ship enabled. PgBouncer defaults them
+	// to 0 and so did pgman, which reads as prudence but is not: every
+	// one of them bounds a way a client can hold a pooled backend
+	// without doing any work, and the zero default meant the only
+	// ceiling was TCP keepalive — tens of minutes, and only if the peer
+	// vanished rather than froze.
+	//
+	// The values are leak ceilings, not performance targets: they are
+	// set where a legitimate workload should never reach them, so the
+	// only sessions they sever are ones already broken. Operators who
+	// know their workload should tighten them (config.yaml ships 60s /
+	// 30m / 5m), and a deployment that genuinely has no ceiling — a
+	// warehouse running multi-hour reports through the proxy — sets a
+	// negative value to opt out explicitly, which is a decision that
+	// now leaves a trace in the config file.
+	if c.QueryTimeout == 0 {
+		c.QueryTimeout = defaultQueryTimeout
+	}
+	if c.ClientIdleTimeout == 0 {
+		c.ClientIdleTimeout = defaultClientIdleTimeout
+	}
+	if c.IdleTransactionTimeout == 0 {
+		c.IdleTransactionTimeout = defaultIdleTransactionTimeout
+	}
+	if c.ClientWriteTimeout == 0 {
+		c.ClientWriteTimeout = defaultClientWriteTimeout
+	}
+	if c.ScramPassthroughIdleTimeout == 0 {
+		c.ScramPassthroughIdleTimeout = defaultScramPassthroughIdleTimeout
+	}
 	if c.CircuitBreakerThreshold == 0 {
 		c.CircuitBreakerThreshold = 5
 	}

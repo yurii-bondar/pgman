@@ -87,9 +87,12 @@ exists. The settings worth knowing up front:
 | `allow_insecure_trust_auth` | Accept every client without a password. | `false` |
 | `max_client_conn` | Global cap on accepted client connections, shared across the TCP and Unix listeners. | `10000` |
 | `query_wait_timeout` | How long a client waits for a backend. | `120s` |
-| `query_timeout` | Max runtime of a single statement. | `0` (off) |
-| `client_idle_timeout` | Close a client silent outside a transaction. | `0` (off) |
-| `idle_transaction_timeout` | Close a client idle inside a transaction. | `0` (off) |
+| `query_timeout` | Max runtime of a single statement. | `15m` |
+| `client_idle_timeout` | Close a client silent outside a transaction. | `30m` |
+| `idle_transaction_timeout` | Close a client idle inside a transaction. | `5m` |
+| `client_write_timeout` | Max time one write to a client may block. | `60s` |
+| `max_prepared_statements` | Named statements kept prepared per backend connection (LRU). | `200` |
+| `scram_passthrough_idle_timeout` | Close a pass-through pool unused for this long. | `30m` |
 | `circuit_breaker_threshold` | Consecutive dial failures before failing fast. | `5` |
 | `circuit_breaker_cooldown` | How long the breaker stays open. | `5s` |
 | `require_backend_tls` | Refuse pools whose DSN does not mandate TLS. | `false` |
@@ -120,12 +123,12 @@ the same role.
 
 ```yaml
 pools:
-  backoffice:
-    backend_dsn: "postgres://app_ro@db:5432/backoffice?sslmode=verify-full"
+  shop:
+    backend_dsn: "postgres://app_ro@db:5432/shop?sslmode=verify-full"
     backend_addr: "db:5432"
     limit: 20
     backend_users:
-      alice: "postgres://alice@db:5432/backoffice?sslmode=verify-full&passfile=/etc/pgman/pgpass"
+      alice: "postgres://alice@db:5432/shop?sslmode=verify-full&passfile=/etc/pgman/pgpass"
 ```
 
 A full DSN rather than a password, so the secret need not live in the
@@ -133,7 +136,7 @@ config at all — point it at a `.pgpass` with `passfile=`, or use
 certificate auth with `sslcert=`/`sslkey=`.
 
 Pools are keyed by the identity they dial with, so a listed user gets
-its own pool — shown as `backoffice/alice` in metrics, `SHOW POOLS` and
+its own pool — shown as `shop/alice` in metrics, `SHOW POOLS` and
 the admin UI — while everyone else keeps sharing the `backend_dsn` one.
 That is what PgBouncer does too: a pool per (database, user), collapsing
 to one per database when the definition forces a single user. Size for
@@ -146,8 +149,8 @@ per role at all:
 
 ```yaml
 pools:
-  backoffice:
-    backend_dsn: "postgres://unused@db:5432/backoffice?sslmode=verify-full"
+  shop:
+    backend_dsn: "postgres://unused@db:5432/shop?sslmode=verify-full"
     backend_addr: "db:5432"
     limit: 20
     scram_passthrough: true
@@ -161,7 +164,7 @@ users resolved through `auth_query` are covered, which `backend_users`
 cannot do. PgBouncer works the same way.
 
 Per-user pools appear on first use, since the credential does not exist
-until the client logs in, and are named `backoffice/alice` like any
+until the client logs in, and are named `shop/alice` like any
 other. Only a completed SCRAM handshake can create one, so the set of
 pools is the set of real roles that have connected.
 
@@ -352,25 +355,26 @@ livenessProbe:
 
 | Signal | Effect |
 | --- | --- |
-| `SIGHUP` | Reload the config file. Adds pools that appeared and drains pools that disappeared. Existing pools are not reconfigured. |
+| `SIGHUP` | Reload the config file: add pools that appeared, drain pools that disappeared, and rebuild pools whose settings changed. Listener, TLS and auth wiring still need a restart. |
 | `SIGTERM` / `SIGINT` | Graceful drain: stop accepting connections, let in-flight transactions finish, close sessions that are between transactions with `57P01`, then exit. Bounded by `shutdown_timeout`. |
 
 ## Known limitations
 
 Honest list, so nobody discovers these in an incident:
 
-- **The session timeouts ship disabled.** `query_timeout`,
-  `client_idle_timeout` and `idle_transaction_timeout` all default to
-  `0`, matching PgBouncer and Postgres. Until you set them, a hung peer
-  is bounded only by TCP keepalive. `config.yaml` has starting values.
-- **No write deadline on the client socket.** A client that stops
-  reading can still stall a relay goroutine at the TCP level.
-- **`max_prepared_statements` evicts rather than refuses.** The cap
-  (default 200 per session) drops the least recently used entry instead
-  of rejecting the new statement. A client that goes past it keeps
-  working, but a Bind for an evicted name can reach a backend that never
-  saw the Parse and get `26000` back; drivers with their own statement
-  cache re-Parse through that.
+- **The session timeouts are ceilings, not policy.** `query_timeout`
+  (15m), `client_idle_timeout` (30m), `idle_transaction_timeout` (5m)
+  and `client_write_timeout` (60s) now ship enabled, but they are set
+  where a healthy workload never reaches them — they bound a leak, they
+  do not enforce an SLO. Tighten them to your workload (`config.yaml`
+  ships 60s / 30m / 5m), or set a negative value to opt out explicitly.
+- **`max_prepared_statements` is a per-backend LRU, not a client
+  quota.** 200 statements stay prepared on each backend connection;
+  beyond that the least recently used one is closed on the backend and
+  re-prepared from the session's own record the next time it is used.
+  The separate ceiling on how many a session may hold at once is 4× the
+  setting, and a client past it is disconnected with `54000` rather
+  than silently losing a statement.
 - **`server_reset_query_skip_same_session` trades determinism for two
   round trips per transaction.** With it on, a session-level `SET` in
   transaction pooling survives whenever the pool hands back the same
@@ -378,22 +382,34 @@ Honest list, so nobody discovers these in an incident:
   away with session state until load starts moving connections between
   clients. Isolation between different clients is unaffected either
   way. Off by default; see above for what it buys.
-- **SCRAM pass-through pools are never evicted.** One per role that has
-  connected since startup, each with its own reaper goroutine. Bounded
-  by your role count, since only a completed SCRAM handshake creates
-  one, but a process that has seen every role keeps every pool.
+- **SCRAM pass-through keeps a ClientKey per user for the life of the
+  process.** The per-user *pools* are now reclaimed after
+  `scram_passthrough_idle_timeout`, but the recovered credential is
+  not: `backendIdentityFor` consults it to decide whether a user gets
+  its own identity on the backend at all, and forgetting it could route
+  a session that has authenticated but not yet routed to the shared
+  `backend_dsn` role instead. Bounded by your role count.
 - **SCRAM pass-through dials through its own connector,** not `pgconn`,
   because `pgconn` offers no way to sign with a recovered `ClientKey`.
   It reuses `pgconn.ParseConfig` for TLS, but the handshake is ours and
   has far less mileage on it than `pgconn`'s.
-- **`SIGHUP` does not resize or re-target existing pools** — only adds
-  and removes them. Changing a limit, DSN or TLS setting needs a restart.
-- **No online restart (`-R`).** This is deliberate; see `DEV_PLAN.md`
-  for the reasoning and the Kubernetes-shaped alternative.
-- **`SHOW POOLS` and `SHOW DATABASES` report `pool_mode` as
-  `transaction`** regardless of the pool's actual mode.
+- **A reload rebuilds a changed pool rather than mutating it.** New
+  sessions get the new settings; sessions already routed to the old
+  pool finish on it and it drains in the background. The config file is
+  the source of truth, so a limit changed through the admin UI and not
+  written back to the YAML is reverted by the next `SIGHUP`.
+- **No online restart (`-R`).** This is deliberate: in Kubernetes,
+  Nomad or systemd-with-socket-activation the same guarantee comes more
+  cleanly from `PAUSE` on the old instance, a rolling update of the
+  Service, and the graceful drain on `SIGTERM`. Handing listen file
+  descriptors between two processes buys nothing there, and the
+  coordination is the expensive part.
+- **`SHOW POOLS` reports `cl_active` as `0`** — per-database client
+  counts are not tracked yet. The `pgman_client_conn_active` metric and
+  the admin UI's session list both have the real numbers.
 - **No published container image or release binaries** yet; build from
-  source.
+  source. `SHOW VERSION` also reports a hardcoded string rather than
+  the build it is actually running.
 
 ## Development
 
@@ -418,10 +434,9 @@ Benchmarks and the soak suite are excluded from the default CI run and
 live in the `perf` workflow, which can be triggered on a pull request by
 adding the `perf` label.
 
-Design rules for contributions are in
-[`.aiassistant/rules/principles.md`](.aiassistant/rules/principles.md);
-the implementation plan and its rationale are in
-[`DEV_PLAN.md`](DEV_PLAN.md).
+Contributions are expected to match the surrounding code: comments
+explain why a thing is the way it is rather than restating what the
+line does, and anything on the hot path comes with a number.
 
 ## License
 

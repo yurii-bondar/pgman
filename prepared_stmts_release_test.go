@@ -129,9 +129,8 @@ func TestBackendPSCacheClearedBeforeAnotherSessionUsesIt(t *testing.T) {
 	// The consequence that actually matters: session B, which has its
 	// own "stmtcache_1" meaning something else entirely, must get its
 	// own Parse prepended rather than inheriting A's.
-	_, swallow := ensureBackendHasStmt(feB, recycled, sessB, "stmtcache_1",
-		&pgproto3.Bind{PreparedStatement: "stmtcache_1"})
-	if swallow != 1 {
+	swallow := ensureBackendHasStmt(feB, recycled, sessB, "stmtcache_1")
+	if swallow.parseComplete != 1 {
 		t.Error("session B's Bind was forwarded with no Parse prepended — it would have executed session A's statement")
 	}
 }

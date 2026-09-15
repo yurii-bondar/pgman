@@ -78,7 +78,7 @@ func TestReceiveStartupMessagePlain(t *testing.T) {
 	}()
 	defer clientConn.Close()
 
-	msg, conn, out, err := receiveStartupMessage(pg, serverConn, nil)
+	msg, conn, out, err := receiveStartupMessage(pg, serverConn, nil, 0)
 	if err != nil {
 		t.Fatalf("receiveStartupMessage: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestReceiveStartupMessageCancelRequest(t *testing.T) {
 	}()
 	defer clientConn.Close()
 
-	msg, _, _, err := receiveStartupMessage(pg, serverConn, nil)
+	msg, _, _, err := receiveStartupMessage(pg, serverConn, nil, 0)
 	if err != nil {
 		t.Fatalf("receiveStartupMessage: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestReceiveStartupMessageRejectsSSLWithoutConfig(t *testing.T) {
 	}()
 	defer clientConn.Close()
 
-	msg, conn, _, err := receiveStartupMessage(pg, serverConn, nil)
+	msg, conn, _, err := receiveStartupMessage(pg, serverConn, nil, 0)
 	if err != nil {
 		t.Fatalf("receiveStartupMessage: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestReceiveStartupMessageUpgradesTLS(t *testing.T) {
 	}()
 	defer clientConn.Close()
 
-	msg, conn, out, err := receiveStartupMessage(pg, serverConn, tlsConfig)
+	msg, conn, out, err := receiveStartupMessage(pg, serverConn, tlsConfig, 0)
 	if err != nil {
 		t.Fatalf("receiveStartupMessage: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestReceiveStartupMessageRejectsGSS(t *testing.T) {
 	}()
 	defer clientConn.Close()
 
-	_, _, _, err := receiveStartupMessage(pg, serverConn, nil)
+	_, _, _, err := receiveStartupMessage(pg, serverConn, nil, 0)
 	if err != nil {
 		t.Fatalf("receiveStartupMessage: %v", err)
 	}

@@ -274,12 +274,38 @@ func deregisterSession(pid uint32) {
 // a value copy, safe to hold and render without touching the live
 // session's own mutex again.
 type SessionInfo struct {
-	PID         uint32
-	User        string
-	Database    string
+	PID      uint32
+	User     string
+	Database string
+	// PoolName is the registry key of the pool serving this session,
+	// which is not always derivable from Database: aliases let several
+	// database names share a pool, and backend_users / pass-through
+	// split one pool into several keys. The pass-through reaper needs
+	// it to tell whether a pool it is about to close still has sessions
+	// pointing at it.
+	PoolName    string
 	Active      bool
 	ConnectedAt time.Time
 	TxStartedAt time.Time
+}
+
+// activeSessionPoolKeys is the set of registry keys some live session
+// is holding, whether or not it currently holds a backend connection.
+//
+// A session between transactions owns no connection but still owns the
+// *pool.Pool it was routed to, and closing that pool underneath it
+// turns its next Acquire into a fatal error. So the pass-through reaper
+// asks this rather than reading pool statistics, which only see
+// connections.
+func activeSessionPoolKeys() map[string]bool {
+	infos := listSessions()
+	keys := make(map[string]bool, len(infos))
+	for _, info := range infos {
+		if info.PoolName != "" {
+			keys[info.PoolName] = true
+		}
+	}
+	return keys
 }
 
 // listSessions snapshots every currently connected session across all
@@ -296,6 +322,7 @@ func listSessions() []SessionInfo {
 				PID:         pid,
 				User:        sess.user,
 				Database:    sess.database,
+				PoolName:    sess.poolName,
 				ConnectedAt: sess.connectedAt,
 				Active:      sess.backend != nil,
 				TxStartedAt: sess.txStartedAt,

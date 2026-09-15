@@ -215,6 +215,12 @@ func sendShowPools(pg *pgproto3.Backend, registry *PoolRegistry) {
 		if p.IsPaused() {
 			paused = "yes"
 		}
+		// The pool's own mode, not a constant: an operator reading
+		// SHOW POOLS during an incident is deciding whether a backend
+		// is pinned to a session or recycled per transaction, and a
+		// hardcoded "transaction" answers that question wrongly for
+		// every pool configured otherwise.
+		cfg, _ := registry.PoolConfig(name)
 		row := [][]byte{
 			[]byte(name),
 			itoa(0), // cl_active — we don't track per-DB client counts yet
@@ -222,7 +228,7 @@ func sendShowPools(pg *pgproto3.Backend, registry *PoolRegistry) {
 			itoa(s.InUse),
 			itoa(s.Idle),
 			itoa(int(s.WaitTime.Milliseconds())),
-			[]byte("transaction"),
+			[]byte(effectivePoolMode(cfg.PoolMode)),
 			[]byte(paused),
 		}
 		sendDataRow(pg, row)
@@ -298,7 +304,7 @@ func sendShowDatabases(pg *pgproto3.Backend, registry *PoolRegistry) {
 			[]byte(port),
 			[]byte(name),
 			itoa(cfg.Limit),
-			[]byte("transaction"),
+			[]byte(effectivePoolMode(cfg.PoolMode)),
 		})
 	}
 	sendCommandComplete(pg, "SHOW")

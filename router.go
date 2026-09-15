@@ -31,11 +31,23 @@ type RouteDecision struct {
 	SessionMode bool
 }
 
+// effectivePoolMode is the one place a configured pool_mode becomes the
+// string the rest of the process compares against, so the relay's
+// release decision and every admin surface that reports a mode cannot
+// disagree about what a pool is doing. An unset mode is transaction
+// pooling, matching PgBouncer's default.
+func effectivePoolMode(configured string) string {
+	if mode := strings.ToLower(configured); mode != "" {
+		return mode
+	}
+	return "transaction"
+}
+
 // Router picks which pool a session's queries should go through, based on
 // what the client named in its StartupMessage. This is the extension point
-// DEV_PLAN Етап 9 reserves for future routing logic — read/write split,
-// sharding hints — without handleConn changing: only a new implementation
-// of this interface.
+// reserved for future routing logic — read/write split, sharding hints —
+// without handleConn changing: only a new implementation of this
+// interface.
 type Router interface {
 	Route(startup *pgproto3.StartupMessage) (RouteDecision, error)
 }
@@ -63,10 +75,7 @@ func (r *DatabaseRouter) Route(startup *pgproto3.StartupMessage) (RouteDecision,
 	if !ok {
 		return RouteDecision{}, fmt.Errorf("database %q is not configured on this proxy", db)
 	}
-	mode := strings.ToLower(cfg.PoolMode)
-	if mode == "" {
-		mode = "transaction"
-	}
+	mode := effectivePoolMode(cfg.PoolMode)
 	return RouteDecision{
 		Pool:        p,
 		PoolName:    key,

@@ -30,6 +30,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -37,41 +38,70 @@ import (
 )
 
 // defaultMaxPreparedStatements caps how many named statements one
-// session may have tracked at a time. Matches PgBouncer's
-// max_prepared_statements default.
+// backend connection keeps prepared. Matches PgBouncer's
+// max_prepared_statements default, and means the same thing it does
+// there: the size of a per-server-connection LRU cache, not a limit on
+// what a client may prepare.
 //
-// A cap is not optional. Every entry holds the statement's full SQL
-// text, the client chooses both the name and how many to create, and
-// max_client_conn defaults to 10000 — so without one, a single client
-// looping over fresh statement names is an out-of-memory primitive that
-// needs no privileges beyond connecting.
+// The distinction is the whole design. The proxy has two caches, and
+// capping the wrong one is what produced the bug this replaced: with a
+// cap on the session's map, an evicted entry took the statement's SQL
+// with it, so the next Bind for that name could reach a backend that
+// had never seen the Parse and come back 26000 "prepared statement does
+// not exist" — a failure that appeared only under the load that moves
+// connections between clients.
 const defaultMaxPreparedStatements = 200
+
+// sessionPSCeilingFactor derives the session map's hard ceiling from
+// max_prepared_statements. The session map must not be capped at the
+// same number as the backend cache — losing an entry there is what
+// breaks replay — but it cannot be unbounded either: every entry holds
+// the statement's full SQL text, the client picks both the names and
+// how many, and max_client_conn defaults to 10000.
+//
+// 4× clears the statement-cache sizes real drivers ship with (pgx 512,
+// pgJDBC 256) by a wide margin, so a client using a bounded cache never
+// approaches it. A session that does reach 800 simultaneously live
+// named statements is not using a driver cache at all — it is leaking
+// names — and gets told so, with the knob to raise in the message.
+const sessionPSCeilingFactor = 4
 
 // prepStmtInfo is what the proxy needs to replay a Parse on any
 // backend that hasn't seen a given prepared statement yet.
 type prepStmtInfo struct {
 	SQL           string
 	ParameterOIDs []uint32
-
-	// lastUsed orders eviction. Stamped from session.psClock on Parse
-	// and on every Bind/Describe that finds this entry, so the cap
-	// sheds the statements a client has stopped using rather than the
-	// ones it is using right now.
-	lastUsed uint64
 }
 
 // psCache is the per-session prepared statement registry — keyed by
 // client-chosen name (e.g. "stmtcache_0001"). Grows on Parse, shrinks
-// on Close.
+// on Close, and — unlike the backend cache below — never drops an entry
+// on its own, because it is the only copy of the SQL a replay needs.
 type psCache map[string]*prepStmtInfo
 
 // backendPSCache tracks which statement names the current backend has
-// actually seen a Parse for. Attached to backendConn so that when the
-// backend is released and later re-Acquired by a different session,
-// the cache is preserved (safe: DISCARD ALL between transactions
-// closes prepared statements, so we also need to clear this on Release
-// — see clearBackendPSCache).
-type backendPSCache map[string]struct{}
+// seen a Parse for, mapped to the clock tick it was last used at so the
+// cap can shed the least recently used one. Attached to backendConn so
+// that when the backend is released and later re-Acquired by a
+// different session, the cache is preserved (safe: DISCARD ALL between
+// transactions closes prepared statements, so we also need to clear
+// this on Release — see clearBackendPSCache).
+type backendPSCache map[string]uint64
+
+// psSwallow counts the backend replies produced by messages the proxy
+// injected on its own initiative, which must be dropped before the
+// response stream reaches the client: it never sent the Parse or the
+// Close they acknowledge, and a driver that receives an unasked-for ack
+// is entitled to treat the stream as corrupt.
+type psSwallow struct {
+	parseComplete int
+	closeComplete int
+}
+
+func (s *psSwallow) add(other psSwallow) {
+	s.parseComplete += other.parseComplete
+	s.closeComplete += other.closeComplete
+}
 
 // processClientMsg is the fused fast-path called before forwarding
 // each client message. It runs three independent checks in ONE type
@@ -86,31 +116,39 @@ type backendPSCache map[string]struct{}
 // zero work — the hottest steady-state message flow is Bind → Execute
 // → Sync repeated forever, and only Bind carries real work here.
 //
-// Return values: (msg unchanged so caller can forward it as-is,
-// swallowParseComplete count as in the old interceptClientMsg).
+// Return values: the message to forward (unchanged — the proxy rewrites
+// nothing), the injected replies the caller must swallow, and an error
+// only when the session has to end. The error path exists for one
+// condition: a client past the session ceiling, which cannot be served
+// correctly and must not be served silently.
 func processClientMsg(
 	fe *pgproto3.Frontend,
 	backend *backendConn,
 	sess *session,
 	msg pgproto3.FrontendMessage,
-) (pgproto3.FrontendMessage, int) {
+) (pgproto3.FrontendMessage, psSwallow, error) {
 	// Single type switch covers everything.
 	switch m := msg.(type) {
 	case *pgproto3.Parse:
 		// PS tracking (unconditional — this is the only path that
 		// populates sess.psCache) + DDL/LISTEN checks on the query text.
+		var swallow psSwallow
 		if m.Name != "" {
-			trackClientParse(backend, sess, m)
+			var err error
+			if swallow, err = trackClientParse(fe, backend, sess, m); err != nil {
+				return msg, swallow, err
+			}
 		}
 		checkSQLSideEffects(backend, sess, m.Query)
-		return msg, 0
+		return msg, swallow, nil
 	case *pgproto3.Bind:
-		return ensureBackendHasStmt(fe, backend, sess, m.PreparedStatement, msg)
+		swallow := ensureBackendHasStmt(fe, backend, sess, m.PreparedStatement)
+		return msg, swallow, nil
 	case *pgproto3.Describe:
 		if m.ObjectType == 'S' {
-			return ensureBackendHasStmt(fe, backend, sess, m.Name, msg)
+			return msg, ensureBackendHasStmt(fe, backend, sess, m.Name), nil
 		}
-		return msg, 0
+		return msg, psSwallow{}, nil
 	case *pgproto3.Close:
 		if m.ObjectType == 'S' && m.Name != "" {
 			if sess.psCache != nil {
@@ -120,91 +158,126 @@ func processClientMsg(
 				delete(backend.preparedStmts, m.Name)
 			}
 		}
-		return msg, 0
+		return msg, psSwallow{}, nil
 	case *pgproto3.Query:
 		// Simple protocol carries SQL directly. Only path where
 		// LISTEN warn / DDL flush can trigger.
 		checkSQLSideEffects(backend, sess, m.String)
-		return msg, 0
+		return msg, psSwallow{}, nil
 	}
 	// Sync, Execute, Flush, CopyData, CopyDone, CopyFail, Terminate:
 	// nothing to inspect. This is the branch the hot Bind/Execute/Sync
 	// loop hits 2 out of 3 messages — kept as a tight tail return.
-	return msg, 0
+	return msg, psSwallow{}, nil
 }
 
-// trackClientParse populates the session/backend caches when a client
-// issues a named Parse. Split from processClientMsg so the *pgproto3.Parse
-// branch there stays tight.
-func trackClientParse(backend *backendConn, sess *session, m *pgproto3.Parse) {
+// trackClientParse records a named Parse in the session map and marks
+// the current backend as holding it, since the client's Parse is about
+// to be forwarded there.
+//
+// Returns an error when the session map is at its ceiling. Nothing is
+// recorded in that case, so the caller must end the session rather than
+// forward the Parse: a statement the proxy has not recorded is one it
+// cannot replay onto the next backend, which is precisely the silent
+// failure this design exists to remove.
+func trackClientParse(fe *pgproto3.Frontend, backend *backendConn, sess *session, m *pgproto3.Parse) (psSwallow, error) {
 	if sess.psCache == nil {
 		sess.psCache = make(psCache)
 	}
 	if _, replacing := sess.psCache[m.Name]; !replacing {
-		evictPreparedStmts(backend, sess)
+		if ceiling := sessionPSCeiling(sess.psLimit); ceiling > 0 && len(sess.psCache) >= ceiling {
+			return psSwallow{}, fmt.Errorf(
+				"session has %d named prepared statements open, the ceiling for max_prepared_statements=%d; "+
+					"raise max_prepared_statements, or have the client close statements it no longer uses",
+				len(sess.psCache), sess.psLimit)
+		}
 	}
-	sess.psClock++
 	sess.psCache[m.Name] = &prepStmtInfo{
 		SQL:           m.Query,
 		ParameterOIDs: append([]uint32(nil), m.ParameterOIDs...),
-		lastUsed:      sess.psClock,
 	}
-	if backend != nil {
-		if backend.preparedStmts == nil {
-			backend.preparedStmts = make(backendPSCache)
-		}
-		backend.preparedStmts[m.Name] = struct{}{}
-	}
+	return markBackendHasStmt(fe, backend, sess, m.Name), nil
 }
 
-// evictPreparedStmts makes room for one more entry, dropping the least
-// recently used statements until the cache is under sess.psLimit.
-//
-// Dropping an entry is safe, not a broken session: the next Bind for
-// that name simply forwards unchanged. If the current backend still
-// holds the statement it runs normally, and if it doesn't, Postgres
-// answers 26000 "prepared statement does not exist" — which is exactly
-// what every driver with its own statement cache (pgx, JDBC) already
-// handles by re-issuing the Parse. Refusing the Parse instead would
-// break the statement the client just asked for, i.e. the hottest one.
-//
-// The scan is O(len(cache)) but runs only when the cache is full, at a
-// default cap of 200. A list-plus-map LRU would turn a 12-line function
-// into a data structure for no measurable gain at that size.
-func evictPreparedStmts(backend *backendConn, sess *session) {
-	limit := sess.psLimit
+// sessionPSCeiling is how many named statements one session may hold at
+// once. Zero means uncapped, which is what a non-positive
+// max_prepared_statements asks for.
+func sessionPSCeiling(limit int) int {
 	if limit <= 0 {
-		return // negative or unset ⇒ no cap (see max_prepared_statements)
+		return 0
 	}
-	for len(sess.psCache) >= limit {
-		var oldestName string
-		var oldestUse uint64
-		for name, info := range sess.psCache {
-			if oldestName == "" || info.lastUsed < oldestUse {
-				oldestName, oldestUse = name, info.lastUsed
+	return limit * sessionPSCeilingFactor
+}
+
+// markBackendHasStmt records that this backend now holds stmtName,
+// evicting least-recently-used statements first if the backend is at
+// max_prepared_statements.
+//
+// Eviction here is safe in the way eviction from the session map was
+// not: the SQL is still in sess.psCache, so a later Bind for an evicted
+// name is replayed onto whatever backend is current, exactly as if that
+// backend had never seen the statement.
+//
+// The victim is closed on the backend rather than merely forgotten.
+// Forgetting it leaves the statement — and its cached plan — resident
+// in the Postgres backend for the life of the connection, which in
+// session pooling is the life of the client. PgBouncer has been
+// criticised for exactly this (pgbouncer#1472); one extra protocol
+// message per eviction is a cheap way not to inherit it.
+func markBackendHasStmt(fe *pgproto3.Frontend, backend *backendConn, sess *session, stmtName string) psSwallow {
+	if backend == nil {
+		return psSwallow{}
+	}
+	if backend.preparedStmts == nil {
+		backend.preparedStmts = make(backendPSCache)
+	}
+
+	var swallow psSwallow
+	limit := sess.psLimit
+	if limit > 0 {
+		if _, known := backend.preparedStmts[stmtName]; !known {
+			// A loop, not a single eviction: the cap can be lowered by
+			// a reload while a connection is already over it.
+			for len(backend.preparedStmts) >= limit {
+				victim, ok := lruStmt(backend.preparedStmts)
+				if !ok {
+					break
+				}
+				delete(backend.preparedStmts, victim)
+				if fe != nil {
+					fe.Send(&pgproto3.Close{ObjectType: 'S', Name: victim})
+					swallow.closeComplete++
+				}
+				if !sess.psEvicted {
+					sess.psEvicted = true
+					slog.Info("prepared-statement cache full on a backend, closing least recently used",
+						"limit", limit,
+						"user", sess.user,
+						"database", sess.database,
+						"hint", "raise max_prepared_statements to keep more statements prepared per backend")
+				}
 			}
 		}
-		if oldestName == "" {
-			return
-		}
-		delete(sess.psCache, oldestName)
-		// Forget it on the backend too. The backend really does still
-		// hold the statement, but we can no longer replay it anywhere
-		// else, so the entry is dead weight — and in session pooling,
-		// where the backend is never released, dead weight that never
-		// gets collected.
-		if backend != nil && backend.preparedStmts != nil {
-			delete(backend.preparedStmts, oldestName)
-		}
-		if !sess.psEvicted {
-			sess.psEvicted = true
-			slog.Warn("prepared-statement cache full, evicting least recently used",
-				"limit", limit,
-				"user", sess.user,
-				"database", sess.database,
-				"hint", "raise max_prepared_statements, or lower the client driver's own statement-cache size")
+	}
+
+	sess.psClock++
+	backend.preparedStmts[stmtName] = sess.psClock
+	return swallow
+}
+
+// lruStmt picks the least recently used entry. The scan is
+// O(len(cache)) but runs only when the cache is full, at a default cap
+// of 200 — a list-plus-map LRU would turn eight lines into a data
+// structure for no measurable gain at that size.
+func lruStmt(cache backendPSCache) (string, bool) {
+	var oldest string
+	var oldestUse uint64
+	for name, used := range cache {
+		if oldest == "" || used < oldestUse {
+			oldest, oldestUse = name, used
 		}
 	}
+	return oldest, oldest != ""
 }
 
 // checkSQLSideEffects runs the two SQL-text-driven side-effect checks
@@ -231,41 +304,40 @@ func ensureBackendHasStmt(
 	backend *backendConn,
 	sess *session,
 	stmtName string,
-	msg pgproto3.FrontendMessage,
-) (pgproto3.FrontendMessage, int) {
+) psSwallow {
 	if stmtName == "" {
-		return msg, 0 // unnamed / referring to a portal — nothing to prep
+		return psSwallow{} // unnamed / referring to a portal — nothing to prep
 	}
-	if sess.psCache == nil {
-		return msg, 0
+	if sess.psCache == nil || backend == nil {
+		return psSwallow{}
 	}
 	info, ok := sess.psCache[stmtName]
 	if !ok {
-		return msg, 0 // we've never seen a Parse for this name — client bug, evicted, or backend-side stmt
+		// No Parse for this name was ever seen on this session: a
+		// client bug, or a statement prepared server-side with SQL
+		// PREPARE. Forward it and let Postgres have the last word.
+		return psSwallow{}
 	}
-	// Touch it: this statement is in active use and must outrank the
-	// ones that are only sitting in the cache when the cap bites.
-	sess.psClock++
-	info.lastUsed = sess.psClock
-	if backend == nil {
-		return msg, 0
-	}
-	if backend.preparedStmts == nil {
-		backend.preparedStmts = make(backendPSCache)
-	}
-	if _, has := backend.preparedStmts[stmtName]; has {
-		return msg, 0 // backend already has it — no prepend needed
+	if backend.preparedStmts != nil {
+		if _, has := backend.preparedStmts[stmtName]; has {
+			// Already there — just touch it so an active statement
+			// outranks idle ones when the cap bites.
+			sess.psClock++
+			backend.preparedStmts[stmtName] = sess.psClock
+			return psSwallow{}
+		}
 	}
 	// Prepend the Parse — same name as client-chosen so the client's
 	// Bind/Describe/Close forwarded right after references the same
 	// name on the backend side too.
+	swallow := markBackendHasStmt(fe, backend, sess, stmtName)
 	fe.Send(&pgproto3.Parse{
 		Name:          stmtName,
 		Query:         info.SQL,
 		ParameterOIDs: info.ParameterOIDs,
 	})
-	backend.preparedStmts[stmtName] = struct{}{}
-	return msg, 1
+	swallow.parseComplete++
+	return swallow
 }
 
 // isDDL returns true when the SQL text looks like a schema-mutating
