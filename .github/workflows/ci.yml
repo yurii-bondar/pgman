@@ -107,11 +107,13 @@ jobs:
       # compiles golangci-lint from source with the toolchain setup-go
       # just installed (matching go.mod exactly), so the version check
       # always passes regardless of what's been released upstream.
-      - uses: golangci/golangci-lint-action@v6
+      # v8 is the first action release that speaks golangci-lint v2, which
+      # is the schema .golangci.yml is written in; v6 installs a v1 binary
+      # and its `config verify` rejects `version`/`formatters` outright.
+      - uses: golangci/golangci-lint-action@v8
         with:
           version: latest
           install-mode: goinstall
-          args: --timeout=5m
 
   vuln:
     name: govulncheck
