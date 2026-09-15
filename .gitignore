@@ -25,3 +25,7 @@ config.local.yaml
 .DS_Store
 .idea/
 *.swp
+
+# Node is only used by the release pipeline (semantic-release via npx);
+# nothing here is built with it.
+node_modules/

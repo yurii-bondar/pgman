@@ -1,0 +1,190 @@
+# Release: decide the version from the commit log, then publish the image.
+#
+# Split into two jobs on purpose. Deciding a version writes to the
+# repository (tag, CHANGELOG, GitHub release) and needs contents: write;
+# pushing an image needs registry credentials and packages: write. A
+# single job would hold both at once for its whole run, and the publish
+# half runs a Dockerfile against third-party base images.
+#
+# The trigger is ci completing, not a push: a version that gets tagged is
+# a version somebody may deploy, and tagging a commit whose tests never
+# ran defeats the point of having them. workflow_run gives the SHA that
+# ci actually verified, which the version job re-checks against main
+# before releasing anything.
+name: release
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  # Escape hatch for a release that needs re-running after a registry
+  # outage or an expired token, without an empty commit.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Serialized, and deliberately not cancel-in-progress: interrupting a
+# release between "tag pushed" and "image published" leaves a version
+# that exists in git and nowhere else.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: semantic-release
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the tag and the CHANGELOG commit
+      issues: write # semantic-release comments on the issues a release closes
+      pull-requests: write
+    outputs:
+      released: ${{ steps.result.outputs.released }}
+      tag: ${{ steps.result.outputs.tag }}
+    steps:
+      # The branch, not the verified SHA: @semantic-release/git pushes a
+      # CHANGELOG commit, which only fast-forwards from the branch tip.
+      # The staleness check below is what keeps that honest.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          # semantic-release reads the whole history to find the last
+          # release and everything committed since.
+          fetch-depth: 0
+
+      # A second push can land while ci is still running on the first. If
+      # main has moved past the commit ci verified, this run would be
+      # releasing code nothing has tested — and the newer commit's own ci
+      # run will trigger a release of its own in a moment anyway.
+      - name: Check main still points at the verified commit
+        id: freshness
+        if: github.event_name == 'workflow_run'
+        run: |
+          head=$(git rev-parse HEAD)
+          verified='${{ github.event.workflow_run.head_sha }}'
+          if [ "$head" != "$verified" ]; then
+            echo "::notice::main is at $head but ci verified $verified — leaving the release to that commit's own run"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v7
+        if: steps.freshness.outputs.stale != 'true'
+        with:
+          node-version: 24
+
+      # Versions are pinned rather than left to npx's "latest", so a
+      # release cut today and one cut in six months are produced by the
+      # same tool. The conventionalcommits preset is a separate package
+      # from the plugins that reference it.
+      - name: semantic-release
+        if: steps.freshness.outputs.stale != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npx --yes \
+            -p semantic-release@25.0.9 \
+            -p @semantic-release/changelog@7.0.0 \
+            -p @semantic-release/git@11.0.1 \
+            -p @semantic-release/github@12.0.9 \
+            -p conventional-changelog-conventionalcommits@10.4.0 \
+            semantic-release
+
+      # semantic-release has no output to read, so the tag it created is
+      # detected from git instead: the git plugin commits the CHANGELOG
+      # and tags that commit, so a tag on HEAD means a release happened.
+      - name: Report what was released
+        id: result
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          tag=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          if [ -z "$tag" ]; then
+            echo "::notice::no releasable commits since the last release"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::notice::released $tag"
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: publish image
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # ghcr.io
+    steps:
+      # The tag, so the image is built from exactly the tree the release
+      # describes rather than from whatever main looks like by now.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      # No QEMU: the Dockerfile pins its build stage to BUILDPLATFORM and
+      # cross-compiles with GOARCH, so nothing in the build runs under
+      # emulation and the runtime stage only copies a static binary.
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both registries get the same tag set from one build. value=
+      # overrides the ref metadata-action would otherwise read, which for
+      # a workflow_run event is the default branch, not the tag.
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: |
+            bondevn/pgman
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.version.outputs.tag }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=pgman
+            org.opencontainers.image.description=PostgreSQL connection pooler with Prometheus metrics and a live admin UI
+            org.opencontainers.image.version=${{ needs.version.outputs.tag }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Stamped into the binary via -ldflags, so a running container
+          # can say which release it is.
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # A plain manifest list. Attestations are worth having, but they
+          # belong with image signing rather than on their own.
+          provenance: false
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Published \`${{ needs.version.outputs.tag }}\`"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

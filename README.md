@@ -36,6 +36,20 @@ out-allocate from Go. The bet is on the parts operators complain about:
 
 ## Quick start
 
+Released images are published for `linux/amd64` and `linux/arm64`:
+
+```sh
+docker run --rm \
+  -v "$PWD/config.yaml:/etc/pgman/config.yaml:ro" \
+  -p 6435:6435 -p 8080:8080 \
+  bondevn/pgman:1            # or ghcr.io/yurii-bondar/pgman:1
+```
+
+Pin a major (`:1`) or an exact version (`:1.4.2`) rather than `latest`,
+which moves under you on every release.
+
+To build from source instead:
+
 ```sh
 # Postgres for local development (bound to 127.0.0.1)
 docker compose up -d postgres
@@ -407,9 +421,10 @@ Honest list, so nobody discovers these in an incident:
 - **`SHOW POOLS` reports `cl_active` as `0`** — per-database client
   counts are not tracked yet. The `pgman_client_conn_active` metric and
   the admin UI's session list both have the real numbers.
-- **No published container image or release binaries** yet; build from
-  source. `SHOW VERSION` also reports a hardcoded string rather than
-  the build it is actually running.
+- **No release binaries** — container images only; build from source if
+  you need a bare binary. `SHOW VERSION` also still reports a hardcoded
+  string; the release version a container is running is in its startup
+  log line, not in admin SQL.
 
 ## Development
 
@@ -437,6 +452,48 @@ adding the `perf` label.
 Contributions are expected to match the surrounding code: comments
 explain why a thing is the way it is rather than restating what the
 line does, and anything on the hot path comes with a number.
+
+### Releases
+
+Releasing is automatic and driven by the commit log. A push to `main`
+runs `ci`; if it passes, `release` asks
+[semantic-release](https://semantic-release.gitbook.io/) what the commits
+since the last tag imply, and — when they imply anything — tags the
+commit, writes `CHANGELOG.md`, publishes a GitHub release, and pushes the
+image to Docker Hub and GHCR for `linux/amd64` and `linux/arm64`.
+
+Which means the commit subject decides the version, so it has to follow
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+| Subject | Effect |
+| --- | --- |
+| `fix: release a backend on client Terminate` | patch — `1.4.2` → `1.4.3` |
+| `feat: add statement pooling mode` | minor — `1.4.2` → `1.5.0` |
+| `perf:` / `refactor:` / `revert:` | patch |
+| `docs:` / `test:` / `ci:` / `chore:` | no release |
+| any type plus `!`, or a `BREAKING CHANGE:` footer | major — `1.4.2` → `2.0.0` |
+
+A commit that does not parse as a Conventional Commit is treated as
+`no release`, which fails quietly: the work lands on `main` and simply
+never ships. If a release should have happened and did not, the commit
+subject is the first place to look.
+
+Two things have to exist for the publish half to work, and both are set
+outside this repository:
+
+- `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets, the
+  token being a Docker Hub access token with Read/Write scope — not the
+  account password. GHCR needs nothing; it authenticates with the
+  workflow's own `GITHUB_TOKEN`.
+- `main` must accept a push from `GITHUB_TOKEN`, because
+  `@semantic-release/git` commits the changelog. If `main` is protected,
+  either allow the GitHub Actions app to bypass it or drop the
+  `@semantic-release/git` plugin from `.releaserc.json` and let the tag
+  and the release notes be the record.
+
+The version is stamped into the binary at link time and appears in the
+`pgman up` log line, so a running container can be identified without
+guessing which digest it came from.
 
 ## License
 

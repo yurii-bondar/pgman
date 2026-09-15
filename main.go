@@ -117,6 +117,13 @@ type runtimeOpts struct {
 	draining atomic.Bool
 }
 
+// version is stamped at link time by the release build
+// (-ldflags "-X main.version=..."). The Dockerfile has always passed
+// that flag, but without this variable to write into, the linker had
+// nothing to do and every published image would have been
+// indistinguishable from every other one.
+var version = "dev"
+
 func defaultRuntimeOpts() *runtimeOpts {
 	return &runtimeOpts{
 		healthCheckTimeout: 500 * time.Millisecond,
@@ -516,6 +523,7 @@ func main() {
 	}()
 
 	slog.Info("pgman up",
+		"version", version,
 		"listen", cfg.ListenAddr,
 		"tls", tlsConfig != nil,
 		"pools", len(poolRegistry.Names()),
