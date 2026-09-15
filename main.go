@@ -226,26 +226,26 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	// require a valid config file, since "which build is this?" is a
 	// question people ask precisely when something is misconfigured.
 	if *showVersion {
-		fmt.Fprintf(stdout, "pgman %s (%s %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		_, _ = fmt.Fprintf(stdout, "pgman %s (%s %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return 0
 	}
 
 	if *genVerifierFor != "" {
 		verifier, err := GenerateSCRAMVerifier(*genVerifierFor, 4096)
 		if err != nil {
-			fmt.Fprintf(stderr, "generate verifier: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "generate verifier: %v\n", err)
 			return 1
 		}
-		fmt.Fprintln(stdout, verifier)
+		_, _ = fmt.Fprintln(stdout, verifier)
 		return 0
 	}
 	if *genAdminPassword != "" {
 		hash, err := generateAdminPasswordHash(*genAdminPassword)
 		if err != nil {
-			fmt.Fprintf(stderr, "generate admin password hash: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "generate admin password hash: %v\n", err)
 			return 1
 		}
-		fmt.Fprintln(stdout, hash)
+		_, _ = fmt.Fprintln(stdout, hash)
 		return 0
 	}
 
@@ -260,7 +260,7 @@ func cli(args []string, stdout, stderr io.Writer) int {
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "config: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "config: %v\n", err)
 		return 1
 	}
 
@@ -269,7 +269,7 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	// leave nothing behind but an exit code.
 	if *healthCheck {
 		if err := probeReady(cfg.MetricsAddr); err != nil {
-			fmt.Fprintf(stderr, "health-check: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "health-check: %v\n", err)
 			return 1
 		}
 		return 0
@@ -292,7 +292,7 @@ func cli(args []string, stdout, stderr io.Writer) int {
 		// to be non-zero, but reporting it as a startup failure would
 		// send whoever reads the log looking for a crash.
 		if !errors.Is(err, errDrainIncomplete) {
-			fmt.Fprintf(stderr, "%v\n", err)
+			_, _ = fmt.Fprintf(stderr, "%v\n", err)
 		}
 		return 1
 	}
@@ -735,12 +735,20 @@ func applyRuntimeLimits(cfg *Config, opts *runtimeOpts, poolRegistry *PoolRegist
 func startConfigReloader(ctx context.Context, configPath string, poolRegistry *PoolRegistry, metrics *proxyMetrics) func() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
+	// Stopping goes through its own channel rather than by closing ch,
+	// which was wrong twice over: a receive from a closed channel is
+	// always ready, so the loop would spin re-reading the config file as
+	// fast as it could, and a signal delivered while it is closed makes
+	// the runtime send on a closed channel and panic.
+	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-stop:
 				return
 			case <-ch:
 				slog.Info("SIGHUP received: reloading config", "path", configPath)
@@ -760,7 +768,7 @@ func startConfigReloader(ctx context.Context, configPath string, poolRegistry *P
 	}()
 	return func() {
 		signal.Stop(ch)
-		close(ch)
+		close(stop)
 		<-done
 	}
 }

@@ -51,6 +51,36 @@ func testConfig(t *testing.T, backendAddr, backendDSN string) *Config {
 	return cfg
 }
 
+// awaitAddrs waits for run to report the addresses it bound, failing the
+// test rather than the package's timeout if it never does. Every wait on
+// a proxy in this file goes through this or awaitRun: an unbounded
+// receive turns one stuck test into a ten-minute CI failure that names no
+// test at all.
+func awaitAddrs(t *testing.T, readyCh <-chan runtimeAddrs, errCh <-chan error) runtimeAddrs {
+	t.Helper()
+	select {
+	case addrs := <-readyCh:
+		return addrs
+	case err := <-errCh:
+		t.Fatalf("run returned before it was ready: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("run never reported ready")
+	}
+	return runtimeAddrs{}
+}
+
+// awaitRun waits for run to unwind after its context was cancelled.
+func awaitRun(t *testing.T, errCh <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(60 * time.Second):
+		t.Fatal("run did not return after its context was cancelled")
+	}
+	return nil
+}
+
 type runningProxy struct {
 	addrs runtimeAddrs
 	errCh chan error
@@ -288,7 +318,7 @@ func TestRunStopsListeningAfterShutdown(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- run(ctx, cfg, "", func(a runtimeAddrs) { readyCh <- a }) }()
 
-	addrs := <-readyCh
+	addrs := awaitAddrs(t, readyCh, errCh)
 	// Reachable while up.
 	conn, err := net.DialTimeout("tcp", addrs.Listen, 5*time.Second)
 	if err != nil {
@@ -297,7 +327,7 @@ func TestRunStopsListeningAfterShutdown(t *testing.T) {
 	_ = conn.Close()
 
 	cancel()
-	if err := <-errCh; err != nil {
+	if err := awaitRun(t, errCh); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
@@ -511,7 +541,7 @@ func TestRunReportsIncompleteDrain(t *testing.T) {
 	readyCh := make(chan runtimeAddrs, 1)
 	errCh := make(chan error, 1)
 	go func() { errCh <- run(ctx, cfg, "", func(a runtimeAddrs) { readyCh <- a }) }()
-	addrs := <-readyCh
+	addrs := awaitAddrs(t, readyCh, errCh)
 
 	// A client that finishes its handshake and then says nothing: its
 	// goroutine is alive, so the drain cannot complete.
