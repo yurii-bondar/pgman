@@ -100,9 +100,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      # Prebuilt golangci-lint releases lag the Go language version in
+      # go.mod (go.mod: 1.27.0), and golangci-lint refuses to run when
+      # its own build was compiled by an older Go than that — install-mode:
+      # binary would fail here the same way it fails locally. goinstall
+      # compiles golangci-lint from source with the toolchain setup-go
+      # just installed (matching go.mod exactly), so the version check
+      # always passes regardless of what's been released upstream.
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          install-mode: goinstall
           args: --timeout=5m
 
   vuln:
