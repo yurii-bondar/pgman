@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/pgman-logo.jpg" alt="pgman — a keeper marshalling Postgres elephants through a connection pool" width="520">
+</p>
+
 # pgman
 
 A PostgreSQL connection pooler written in Go — transaction, session and
@@ -274,6 +278,52 @@ config-reload preview.
 
 It binds to loopback by default. Binding it anywhere else requires
 configuring authentication — HTTP Basic (bcrypt), OIDC, or mutual TLS.
+
+The dashboard is four tabs. Three of them — live status, sessions and
+recent errors — are server-rendered fragments pushed over the `/events`
+SSE stream twice a second, so they follow the proxy without a reload;
+the fourth is the management form.
+
+**Live status** — one row per pool with the numbers you need to decide
+whether a pool is healthy: in-use against the limit, idle, cumulative
+acquire calls and the time spent in them, discards, and dial errors.
+`IN USE / LIMIT` climbing to the limit while `ACQUIRE TIME` grows is
+back-pressure; `DIAL ERRORS` moving on its own is a backend problem.
+
+![Live status tab: per-pool in-use, idle, acquire and error counters](docs/images/admin-ui-live-status.png)
+
+**Sessions** — every connected client, oldest first, since a stuck
+session is usually an old one. `PID` is the fake PID pgman handed the
+client rather than a real backend PID, and it doubles as the handle for
+cancellation. A session counts as active while it holds a backend
+connection, and `TX TIME` says for how long — that is the column that
+finds a client sitting in an open transaction on a pool other sessions
+are waiting for. Active rows offer a cancel button, which sends a
+`CancelRequest` for the query actually running on that backend.
+
+![Sessions tab: client sessions with PID, user, database, state and transaction time](docs/images/admin-ui-sessions.png)
+
+**Manage pools** — resize or remove an existing pool, or add one at
+runtime without a restart. Removal and resize let active sessions finish
+first and drain the old connections in the background. A new pool needs
+both `backend_dsn` and `backend_addr`, the same pair the YAML config
+uses. Because this form turns pgman into a dialer for an
+operator-supplied address, the address goes through
+`validateBackendAddr` first, which rejects link-local and multicast
+targets — without that check the panel would be an SSRF primitive
+pointed at the cloud metadata service.
+
+![Manage pools tab: resize and remove controls plus the add-pool form](docs/images/admin-ui-manage-pools.png)
+
+**Recent errors** — a bounded ring buffer of pool events (`discard` and
+`dial_error`), keeping the backend's own message intact rather than a
+summarised count, because the counters on the status tab tell you *that*
+dialling failed and only the text tells you why. The screenshot is a
+pool pointed at a Postgres that refuses TLS — the common first-run
+mistake, and one that reads very differently from a wrong password or a
+missing database.
+
+![Recent errors tab: recent discard and dial_error events per pool with the backend's message](docs/images/admin-ui-recent-errors.png)
 
 ### Health probes
 
