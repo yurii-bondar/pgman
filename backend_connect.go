@@ -97,7 +97,9 @@ func dialAndHandshake(ctx context.Context, cfg *pgconn.Config, target connectTar
 		return nil, fmt.Errorf("set handshake deadline: %w", err)
 	}
 
-	var conn net.Conn = raw
+	// Holds either the raw socket or the TLS wrapper below; both are
+	// net.Conn, which is all the rest of the handshake needs.
+	conn := raw
 	if target.tlsConfig != nil {
 		tlsConn, tlsErr := startBackendTLS(raw, target.tlsConfig)
 		if tlsErr != nil {

@@ -65,10 +65,10 @@ jobs:
       PGMAN_TEST_PG_DSN: "postgres://pgman_test:pgman_test@127.0.0.1:5432/pgman_test?sslmode=disable"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: |

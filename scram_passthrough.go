@@ -133,7 +133,7 @@ func scramClientAuth(fe *pgproto3.Frontend, user string, pc passthroughCreds, me
 	// here turns "password authentication failed", which sends an
 	// operator hunting for a wrong password that does not exist, into a
 	// statement of what is actually wrong.
-	if salt != pc.creds.KeyFactors.Salt || iters != pc.creds.KeyFactors.Iters {
+	if salt != pc.creds.Salt || iters != pc.creds.Iters {
 		return fmt.Errorf("pgman's verifier for %q does not match the backend's "+
 			"(salt or iteration count differ) — SCRAM pass-through requires the same "+
 			"verifier on both sides, so auth_users must hold a copy of the backend's "+

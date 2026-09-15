@@ -23,7 +23,10 @@ func runSCRAM(t *testing.T, password string, cb *scram.ChannelBinding) (scramExc
 		t.Fatalf("new client: %v", err)
 	}
 	kf := scram.KeyFactors{Salt: "abcdefgh", Iters: 4096}
-	creds := client.GetStoredCredentials(kf)
+	creds, err := client.GetStoredCredentialsWithError(kf)
+	if err != nil {
+		t.Fatalf("stored credentials: %v", err)
+	}
 
 	server, err := scram.SHA256.NewServer(func(string) (scram.StoredCredentials, error) {
 		return creds, nil
@@ -77,7 +80,10 @@ func expectedClientKey(t *testing.T, password string, kf scram.KeyFactors) []byt
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	creds := client.GetStoredCredentials(kf)
+	creds, err := client.GetStoredCredentialsWithError(kf)
+	if err != nil {
+		t.Fatalf("stored credentials: %v", err)
+	}
 	// StoredKey = H(ClientKey); the library does not expose ClientKey,
 	// so recompute it the way the spec defines and check the hash.
 	return creds.StoredKey

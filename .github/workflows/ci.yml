@@ -29,8 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -69,8 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -85,7 +85,7 @@ jobs:
         run: |
           go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -95,8 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -107,10 +107,10 @@ jobs:
       # compiles golangci-lint from source with the toolchain setup-go
       # just installed (matching go.mod exactly), so the version check
       # always passes regardless of what's been released upstream.
-      # v8 is the first action release that speaks golangci-lint v2, which
-      # is the schema .golangci.yml is written in; v6 installs a v1 binary
-      # and its `config verify` rejects `version`/`formatters` outright.
-      - uses: golangci/golangci-lint-action@v8
+      # v7+ of the action speaks golangci-lint v2, which is the schema
+      # .golangci.yml is written in; v6 installs a v1 binary and its
+      # `config verify` rejects `version`/`formatters` outright.
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
           install-mode: goinstall
@@ -120,8 +120,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -155,8 +155,8 @@ jobs:
       PGMAN_TEST_RACE: "1"
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -186,12 +186,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       # Build only — publishing is a release concern, not a PR concern.
       # This exists so a Dockerfile break is caught by the PR that causes
       # it rather than by whoever next cuts a release.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false

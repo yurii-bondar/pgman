@@ -48,7 +48,7 @@ func tlsCancelListener(t *testing.T, sslReply byte) (addr string, received chan 
 			return
 		}
 
-		var stream net.Conn = conn
+		stream := conn
 		if sslReply == 'S' {
 			tlsConn := tls.Server(conn, &tls.Config{
 				Certificates: []tls.Certificate{cert},
