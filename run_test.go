@@ -415,9 +415,20 @@ func TestRunFailsOnBrokenConfiguration(t *testing.T) {
 			want: "admin tls",
 		},
 		{
-			name:  "unix socket dir does not exist",
-			taint: func(c *Config) { c.UnixSocketDir = filepath.Join(dir, "no-such-dir") },
-			want:  "unix socket",
+			// A directory that cannot be created, rather than one that
+			// merely does not exist: openUnixSocket calls MkdirAll, so a
+			// missing directory is created and is not a failure at all.
+			// A path with a regular file in the middle of it cannot be,
+			// on any platform.
+			name: "unix socket dir cannot be created",
+			taint: func(c *Config) {
+				blocker := filepath.Join(dir, "not-a-directory")
+				if err := os.WriteFile(blocker, []byte("in the way"), 0o600); err != nil {
+					t.Fatalf("write blocker: %v", err)
+				}
+				c.UnixSocketDir = filepath.Join(blocker, "socket")
+			},
+			want: "unix socket",
 		},
 	}
 
@@ -432,8 +443,17 @@ func TestRunFailsOnBrokenConfiguration(t *testing.T) {
 			}
 			tc.taint(cfg)
 
-			err := run(context.Background(), cfg, "", func(runtimeAddrs) {
+			// A cancellable context, because a case whose premise is
+			// wrong must fail rather than hang: run blocks on ctx.Done
+			// once it is up, so with context.Background() an expectation
+			// that does not hold costs the whole package its timeout —
+			// which is exactly what one of these cases did.
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			err := run(ctx, cfg, "", func(runtimeAddrs) {
 				t.Error("run reported ready despite a broken configuration")
+				cancel()
 			})
 			if err == nil {
 				t.Fatal("run succeeded")
