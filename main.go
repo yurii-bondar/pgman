@@ -48,8 +48,24 @@ type runtimeOpts struct {
 	clientIdleTimeout      time.Duration
 	idleTransactionTimeout time.Duration
 	serverResetQuery       string
-	maxClientConn          int
-	metrics                *proxyMetrics // nil in tests — every observe call must nil-check first
+	// resetSkipSameSession skips the scrub when the same session
+	// reacquires the connection. See
+	// Config.ServerResetQuerySkipSameSession.
+	resetSkipSameSession bool
+
+	// clientSlots is the max_client_conn semaphore: one buffered slot
+	// per admissible client connection, nil meaning unlimited.
+	//
+	// It lives here, shared, rather than being allocated inside
+	// acceptLoopWithOpts, because there is more than one accept loop —
+	// TCP and the optional Unix socket — and a per-loop semaphore made
+	// the real ceiling 2 × max_client_conn. The cap has to be a
+	// property of the process, since so are the file descriptors and
+	// the memory it is there to protect. Set it through
+	// setMaxClientConn, never by hand.
+	clientSlots chan struct{}
+
+	metrics *proxyMetrics // nil in tests — every observe call must nil-check first
 
 	// adminDatabase names the virtual DB that switches a client into
 	// PgBouncer-compatible admin SQL mode (SHOW POOLS, PAUSE, RESUME…).
@@ -59,6 +75,16 @@ type runtimeOpts struct {
 	// to adminDatabase. Closes over the pool registry so SHOW POOLS
 	// sees the live set.
 	adminSession func(pg *pgproto3.Backend)
+
+	// adminUsers is the set of client usernames allowed into that
+	// console. A nil/empty set denies everyone — admin SQL is opt-in,
+	// because the alternative (any authenticated client) hands every
+	// tenant a PAUSE that takes the whole proxy down.
+	adminUsers map[string]bool
+
+	// maxPreparedStmts caps the per-session prepared-statement cache;
+	// <= 0 disables the cap. See Config.MaxPreparedStatements.
+	maxPreparedStmts int
 
 	// trackExtraParams is the whitelist of client StartupMessage
 	// RuntimeParams to replay on every new backend Acquire (transaction
@@ -90,6 +116,10 @@ type runtimeOpts struct {
 func defaultRuntimeOpts() *runtimeOpts {
 	return &runtimeOpts{
 		healthCheckTimeout: 500 * time.Millisecond,
+		// Not zero like the other knobs: zero here would mean
+		// "uncapped", and a permissive default that reintroduces the
+		// unbounded cache is the wrong direction to be wrong in.
+		maxPreparedStmts: defaultMaxPreparedStatements,
 	}
 }
 
@@ -97,7 +127,7 @@ func defaultRuntimeOpts() *runtimeOpts {
 // from parsed Config values. Kept separate so main() stays orchestration-
 // only and tests can build stripped-down opts without loading YAML.
 func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
-	return &runtimeOpts{
+	opts := &runtimeOpts{
 		clientLoginTimeout: cfg.ClientLoginTimeout,
 		queryWaitTimeout:   cfg.QueryWaitTimeout,
 		tcpKeepAlive:       cfg.TCPKeepAlive,
@@ -107,16 +137,52 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		clientIdleTimeout:      cfg.ClientIdleTimeout,
 		idleTransactionTimeout: cfg.IdleTransactionTimeout,
 
-		serverResetQuery: cfg.ServerResetQuery,
-		maxClientConn:    cfg.MaxClientConn,
-		metrics:          metrics,
-		adminDatabase:    cfg.AdminDatabase,
-		trackExtraParams: cfg.TrackExtraParameters,
+		serverResetQuery:     cfg.ServerResetQuery,
+		resetSkipSameSession: cfg.ServerResetQuerySkipSameSession,
+		maxPreparedStmts:     cfg.MaxPreparedStatements,
+		metrics:              metrics,
+		adminDatabase:        cfg.AdminDatabase,
+		adminUsers:           adminUserSet(cfg.AdminUsers),
+		trackExtraParams:     cfg.TrackExtraParameters,
 		// adminSession is wired up by main() where the registry is
 		// available. Left nil here so plain runtimeOptsFromConfig
 		// callers (tests) don't accidentally enable admin SQL without
 		// providing a registry.
 	}
+	opts.setMaxClientConn(cfg.MaxClientConn)
+	return opts
+}
+
+// setMaxClientConn allocates the one semaphore every accept loop shares.
+// n <= 0 means unlimited.
+//
+// This is the only way to set the cap. Making it a method rather than a
+// plain field is what stops the previous bug from coming back: a caller
+// that assigned a number and left the semaphore to be created later,
+// per listener, got a limit that multiplied by the number of listeners.
+func (o *runtimeOpts) setMaxClientConn(n int) {
+	if n <= 0 {
+		o.clientSlots = nil
+		return
+	}
+	o.clientSlots = make(chan struct{}, n)
+}
+
+// adminUserSet turns the configured admin_users list into the lookup
+// the startup path uses. Returns nil for an empty list, which reads as
+// "deny everyone" — a nil map lookup is false, so the caller needs no
+// separate nil check.
+func adminUserSet(users []string) map[string]bool {
+	if len(users) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(users))
+	for _, u := range users {
+		if u != "" {
+			set[u] = true
+		}
+	}
+	return set
 }
 
 func main() {
@@ -163,9 +229,21 @@ func main() {
 	promRegistry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := newProxyMetrics(promRegistry)
 
+	// The pass-through store exists only when a pool asks for it, so a
+	// deployment that does not use the feature never derives, and never
+	// holds, any authentication material.
+	var keyStore *clientKeyStore
+	for _, pc := range cfg.Pools {
+		if pc.ScramPassthrough {
+			keyStore = newClientKeyStore()
+			break
+		}
+	}
+
 	poolRegistry := NewPoolRegistryWithDefaults(cfg.Pools, eventLog, cfg, func(name string) pool.ObserveWaitFunc {
 		return metrics.observeAcquire(name)
 	})
+	poolRegistry.SetClientKeyStore(keyStore)
 	promRegistry.MustRegister(newPoolsCollector(poolRegistry))
 	// pgbouncer_exporter-compatible aliases: same underlying stats,
 	// PgBouncer-named metrics so Grafana dashboards work unchanged.
@@ -324,6 +402,11 @@ func main() {
 			slog.Info("auth_query enabled",
 				"dsn_host_hint", firstToken(cfg.AuthQueryDSN, "@"),
 				"cache_ttl", cfg.AuthQueryCacheTTL)
+		}
+		scramAuth.SetClientKeyStore(keyStore)
+		if keyStore != nil {
+			slog.Info("scram pass-through enabled — backend connections are opened as the authenticated client",
+				"note", "pgman holds a password-equivalent in memory for every user that logs in")
 		}
 		authBackend = scramAuth
 	} else {
@@ -542,15 +625,17 @@ func acceptLoop(listener net.Listener, router Router, authBackend AuthBackend, t
 }
 
 // acceptLoopWithOpts accepts connections until listener is closed,
-// enforcing max_client_conn via a semaphore (0 = unlimited) and tagging
-// every accepted conn with TCP keepalive when tcpKeepAlive > 0. Every
-// handleConn goroutine is tracked in wg so main can wait for in-flight
-// sessions to finish instead of cutting them off mid-transaction.
+// enforcing max_client_conn via the semaphore in opts (nil = unlimited)
+// and tagging every accepted conn with TCP keepalive when tcpKeepAlive
+// > 0. Every handleConn goroutine is tracked in wg so main can wait for
+// in-flight sessions to finish instead of cutting them off
+// mid-transaction.
+//
+// The semaphore comes from opts and is shared with every other accept
+// loop in the process: max_client_conn caps the proxy, not each
+// listener it happens to be running.
 func acceptLoopWithOpts(listener net.Listener, router Router, authBackend AuthBackend, tlsConfig *tls.Config, limiter *authLimiter, wg *sync.WaitGroup, opts *runtimeOpts) {
-	var sem chan struct{}
-	if opts.maxClientConn > 0 {
-		sem = make(chan struct{}, opts.maxClientConn)
-	}
+	sem := opts.clientSlots
 
 	for {
 		client, err := listener.Accept()
@@ -660,6 +745,11 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 		if err != nil {
 			return nil, fmt.Errorf("hijack: %w", err)
 		}
+		cancelTLS, err := cancelTLSConfigFor(hijacked.Conn, parsed)
+		if err != nil {
+			_ = hijacked.Conn.Close()
+			return nil, err
+		}
 		return &backendConn{
 			Conn: hijacked.Conn,
 			addr: addr,
@@ -667,8 +757,31 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 			// v5's SecretKey is already []byte; the type change ripples
 			// through backendConn/session/sendRealCancelRequest.
 			secretKey: hijacked.SecretKey,
+			cancelTLS: cancelTLS,
 		}, nil
 	}
+}
+
+// cancelTLSConfigFor decides how a later CancelRequest for this backend
+// must be dialed. A cancel needs its own connection, so it has to repeat
+// whatever transport the original one negotiated.
+//
+// The established connection is the authority, not the DSN: sslmode
+// values like "prefer" decide per attempt, and only the resulting
+// net.Conn says which way it went. Returns nil for a plaintext backend.
+func cancelTLSConfigFor(conn net.Conn, parsed *pgconn.Config) (*tls.Config, error) {
+	if _, isTLS := conn.(*tls.Conn); !isTLS {
+		return nil, nil
+	}
+	if parsed == nil || parsed.TLSConfig == nil {
+		// The connection is encrypted but we cannot reconstruct how.
+		// Failing the dial is the only honest option: handing back a
+		// backend whose cancels are silently impossible is exactly the
+		// bug this field exists to fix, and falling back to a plaintext
+		// cancel would put the cancel key on the wire in the clear.
+		return nil, fmt.Errorf("backend negotiated TLS but the DSN exposes no TLS config to reuse for cancel requests")
+	}
+	return parsed.TLSConfig, nil
 }
 
 // firstToken returns everything after the last occurrence of sep in s
@@ -843,25 +956,43 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 		// virtual admin database, don't route — run our in-process
 		// SHOW / PAUSE / RESUME / RECONNECT handler and never touch a
 		// real Postgres.
-		if opts.adminDatabase != "" && opts.adminSession != nil &&
-			m.Parameters["database"] == opts.adminDatabase {
-			slog.Info("startup: admin session",
-				"user", m.Parameters["user"],
-				"database", m.Parameters["database"])
-			if opts.metrics != nil {
-				opts.metrics.ClientLoginOK.Inc()
-			}
-			pid, sess := registerSession(m.Parameters["user"], m.Parameters["database"])
-			defer deregisterSession(pid)
-			if err := fakeAuth(pg, pid, sess.secret); err != nil {
-				slog.Warn("admin: fake auth", "err", err)
+		//
+		// Passing client auth is NOT enough to get in here. The console
+		// can PAUSE every pool (a total outage issued by any tenant)
+		// and SHOW CLIENTS lists every other tenant's user/database, so
+		// it needs its own allowlist on top — PgBouncer's admin_users.
+		if opts.adminDatabase != "" && m.Parameters["database"] == opts.adminDatabase {
+			if opts.adminSession != nil && opts.adminUsers[m.Parameters["user"]] {
+				slog.Info("startup: admin session",
+					"user", m.Parameters["user"],
+					"database", m.Parameters["database"])
+				if opts.metrics != nil {
+					opts.metrics.ClientLoginOK.Inc()
+				}
+				pid, sess := registerSession(m.Parameters["user"], m.Parameters["database"])
+				defer deregisterSession(pid)
+				if err := fakeAuth(pg, pid, sess.secret); err != nil {
+					slog.Warn("admin: fake auth", "err", err)
+					return
+				}
+				if opts.clientLoginTimeout > 0 {
+					_ = client.SetDeadline(time.Time{})
+				}
+				opts.adminSession(pg)
 				return
 			}
-			if opts.clientLoginTimeout > 0 {
-				_ = client.SetDeadline(time.Time{})
-			}
-			opts.adminSession(pg)
-			return
+			// Not authorised. Deliberately no distinct error: fall
+			// through to routing, which answers exactly as it would for
+			// any other unconfigured database name. A dedicated
+			// "not an admin" reply would confirm the console exists and
+			// hand an attacker a probe for which users are admins.
+			slog.Warn("startup: admin console denied",
+				"user", m.Parameters["user"],
+				"database", m.Parameters["database"],
+				"reason", "user is not listed in admin_users")
+			auditLog("admin_denied",
+				"user", m.Parameters["user"],
+				"database", m.Parameters["database"])
 		}
 
 		decision, err := router.Route(m)
@@ -938,6 +1069,7 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 		if sess.poolName == "" {
 			sess.poolName = sess.database
 		}
+		sess.psLimit = opts.maxPreparedStmts
 		sess.trackedParams = extractTrackedParams(m.Parameters, opts.trackExtraParams)
 		relay(client, pg, decision.Pool, sess, opts)
 	}
@@ -1111,22 +1243,11 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 		// bugs get.
 		_ = backend.SetReadDeadline(time.Time{})
 		if reusable {
-			if opts.serverResetQuery != "" {
-				if err := runResetQuery(backend, opts.serverResetQuery, opts.healthCheckTimeout); err != nil {
-					// A failed reset means we can't guarantee session
-					// isolation — discard instead of reusing.
-					slog.Warn("relay: server_reset_query failed, discarding backend", "err", err)
-					p.Discard(backend)
-					backend, fe = nil, nil
-					sess.setBackend(nil)
-					return
-				}
-				// DISCARD ALL wipes every prepared statement on the
-				// backend — invalidate our tracking cache too, else
-				// the next Bind for a "known" stmt would skip the
-				// lazy Parse and error with "does not exist".
-				clearBackendPSCache(backend)
-			}
+			// No scrub here, and no round trip. The connection keeps
+			// carrying this session's state, tagged with whose it is;
+			// adoptBackend does the scrubbing when — and only when — a
+			// different session picks it up. See stateOwner.
+			backend.stateOwner = sess.id
 			p.Release(backend)
 		} else {
 			p.Discard(backend)
@@ -1254,16 +1375,20 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 			fe = pgproto3.NewFrontend(backend, backend)
 			sess.setBackend(backend)
 
-			// application_name & friends: replay startup params on
-			// the freshly-acquired backend so pg_stat_activity /
-			// TimeZone / client_encoding match what the client asked
-			// for. Silent — the client never sees these SETs.
-			if len(sess.trackedParams) > 0 {
-				if err := applyTrackedParams(fe, sess.trackedParams); err != nil {
-					slog.Warn("relay: apply tracked params", "err", err)
-					release(false)
+			if err := adoptBackend(fe, backend, sess, opts); err != nil {
+				// The connection could not be made safe for this
+				// session, so it must not be handed over. Discard it
+				// and fail this one query rather than the session: a
+				// retry lands on a different (or fresh) backend, which
+				// is very likely to work.
+				slog.Warn("relay: adopting backend failed", "err", err)
+				p.Discard(backend)
+				backend, fe = nil, nil
+				sess.setBackend(nil)
+				if err := failQuery(pg, msg, "08006", "backend could not be prepared for this session: "+err.Error()); err != nil {
 					return
 				}
+				continue
 			}
 		}
 
@@ -1420,7 +1545,7 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 				// Replication streams are open-ended by design — a
 				// walsender can idle for minutes between WAL records.
 				_ = backend.SetReadDeadline(time.Time{})
-				if err := relayCopyBoth(pg, fe); err != nil {
+				if err := relayCopyBoth(pg, fe, client, backend); err != nil {
 					slog.Warn("relay: copy-both", "err", err)
 					release(false)
 					return
@@ -1468,6 +1593,77 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 			break
 		}
 	}
+}
+
+// adoptBackend makes a just-acquired connection safe and correct for
+// sess to use, and is where server_reset_query now runs.
+//
+// The scrub used to happen on release, which cost a full round trip at
+// the end of every transaction — and with track_extra_parameters on by
+// default, the replay of application_name and friends cost another one
+// at the start of the next. Both were paid even when the connection
+// went straight back to the session that had just handed it over,
+// which with a LIFO pool and a serial client is the overwhelmingly
+// common case. Between two transactions of the same session those two
+// round trips scrub state the session owns, only to immediately
+// restore it: the isolation they provide is isolation from nobody.
+//
+// So the work is deferred to here, where the next owner is finally
+// known, and skipped outright when that owner is unchanged. What the
+// deferral does NOT do is weaken isolation: no statement from a new
+// session reaches the backend before the scrub, because this runs
+// before the first message is forwarded.
+//
+// The trade is that a released connection now sits in the idle stack
+// still holding its last owner's session state — GUCs, prepared
+// statements, temp tables, session advisory locks — instead of being
+// scrubbed immediately. That state belongs to a client that is still
+// connected and, in transaction pooling, usually about to come back;
+// server_idle_timeout and server_lifetime bound how long it can linger
+// if that client goes quiet instead.
+func adoptBackend(fe *pgproto3.Frontend, backend *backendConn, sess *session, opts *runtimeOpts) error {
+	// Every session that touches a connection needs a real identity, or
+	// two sessions built outside registerSession would both read as 0
+	// and hand each other an unscrubbed backend. Issued lazily here so
+	// the guarantee holds for any session, however it was constructed.
+	if sess.id == 0 {
+		sess.id = nextSessionID.Add(1)
+	}
+	if opts.resetSkipSameSession && backend.stateOwner == sess.id {
+		return nil // our own state, already in place: nothing to do
+	}
+
+	// stateOwner == 0 is a connection nobody has used yet, so there is
+	// nothing to scrub — but its GUCs are still Postgres defaults, so
+	// the tracked-parameter replay below still has to run.
+	if backend.stateOwner != 0 && opts.serverResetQuery != "" {
+		if err := runResetQuery(fe, backend, opts.serverResetQuery, opts.healthCheckTimeout); err != nil {
+			return fmt.Errorf("server_reset_query: %w", err)
+		}
+	}
+
+	// Drop the record of which statements the backend was shown. It is
+	// the previous session's, and statement names are chosen per
+	// client: left in place, this session's Bind for a colliding name
+	// would skip its lazy Parse and run the other client's statement.
+	//
+	// Note this happens whether or not the reset query ran. When an
+	// operator disables server_reset_query the statements themselves
+	// survive on the backend and a colliding name now raises 42P05,
+	// which is a loud, correct failure rather than a silent wrong one.
+	clearBackendPSCache(backend)
+
+	// application_name & friends: replay startup params so
+	// pg_stat_activity / TimeZone / client_encoding match what the
+	// client asked for. Silent — the client never sees these SETs.
+	if len(sess.trackedParams) > 0 {
+		if err := applyTrackedParams(fe, sess.trackedParams); err != nil {
+			return fmt.Errorf("apply tracked params: %w", err)
+		}
+	}
+
+	backend.stateOwner = sess.id
+	return nil
 }
 
 // clientFlushThreshold is how many bytes of backend replies may sit in
@@ -1577,7 +1773,11 @@ func isTerminalMessage(msg pgproto3.FrontendMessage) bool {
 // with per-message flush (replication is latency-sensitive, and each
 // CopyData carries a WAL record or keepalive that the peer needs
 // promptly). Errors on either side abort the pair.
-func relayCopyBoth(pg *pgproto3.Backend, fe *pgproto3.Frontend) error {
+//
+// client and backend are the sockets behind pg and fe. They are needed
+// because the two pumps can only be woken through their own
+// connections: see the drain logic after the goroutines below.
+func relayCopyBoth(pg *pgproto3.Backend, fe *pgproto3.Frontend, client, backend net.Conn) error {
 	// Channel carries a single error from whichever direction fails
 	// first. Second failure (usually the peer noticing the socket
 	// closing) is discarded — the first error is the interesting one.
@@ -1641,13 +1841,52 @@ func relayCopyBoth(pg *pgproto3.Backend, fe *pgproto3.Frontend) error {
 		}
 	}()
 
-	// First goroutine to finish decides the outcome. Drain the second
-	// so we don't leave it blocked on a dead socket (Receive will
-	// error once the peer closes, so this returns fast).
+	// First goroutine to finish decides the outcome. The second has to
+	// be drained too, or it outlives this call holding a reference to
+	// both connections.
+	//
+	// It will not always end on its own. Both pumps deliberately run
+	// without read deadlines — a walsender can idle for minutes between
+	// WAL records — so when one direction stops, the other can be
+	// parked in Receive on a socket whose peer has nothing left to say.
+	// Waiting for it unconditionally is what turned a client that
+	// vanished mid-replication into a permanently stuck relay: three
+	// goroutines, the backend connection and its pool slot, leaked for
+	// the life of the process.
+	//
+	// Tripping the read deadlines is what unparks it. SetReadDeadline
+	// is safe to call concurrently with a Read already in flight, and a
+	// deadline in the past fails that Read immediately.
 	first := <-errCh
-	<-errCh
+	grace := copyBothDrainGrace
+	if first != nil {
+		// One side is already broken, so relayImpl is going to discard
+		// this backend regardless. Nothing to wait politely for.
+		grace = 0
+	}
+	select {
+	case <-errCh:
+	case <-time.After(grace):
+		past := time.Now().Add(-time.Second)
+		_ = client.SetReadDeadline(past)
+		_ = backend.SetReadDeadline(past)
+		<-errCh
+		// Clear them again: on the clean path the caller keeps using
+		// both connections for the rest of the session, and a deadline
+		// left in the past would fail its very next read.
+		_ = client.SetReadDeadline(time.Time{})
+		_ = backend.SetReadDeadline(time.Time{})
+	}
 	return first
 }
+
+// copyBothDrainGrace is how long relayCopyBoth lets the second
+// direction finish on its own after the first one has ended, before
+// forcing it. The clean case needs a little room — the backend answers
+// a client's CopyDone with CopyDone + CommandComplete + RFQ, and that
+// round trip is real network time — while the failure case skips this
+// entirely. A var, not a const, so tests can shorten it.
+var copyBothDrainGrace = 5 * time.Second
 
 // relayCopyIn drives the COPY-IN sub-protocol: backend has sent
 // CopyInResponse and is now blocked waiting for the client's data
@@ -1707,7 +1946,11 @@ func relayCopyIn(pg *pgproto3.Backend, fe *pgproto3.Frontend) error {
 // runResetQuery sends the configured server_reset_query on the backend
 // and consumes until ReadyForQuery. Uses the same deadline as the
 // health-check path since it's the same round-trip shape.
-func runResetQuery(backend *backendConn, query string, timeout time.Duration) error {
+// fe is the caller's own Frontend rather than a fresh one. Two
+// Frontends reading the same socket is a desync waiting to happen — the
+// one that is thrown away takes whatever it has buffered with it — and
+// reusing the live one also skips a per-transaction allocation.
+func runResetQuery(fe *pgproto3.Frontend, backend *backendConn, query string, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
@@ -1716,7 +1959,6 @@ func runResetQuery(backend *backendConn, query string, timeout time.Duration) er
 	}
 	defer func() { _ = backend.SetDeadline(time.Time{}) }()
 
-	fe := pgproto3.NewFrontend(backend, backend)
 	fe.Send(&pgproto3.Query{String: query})
 	if err := fe.Flush(); err != nil {
 		return fmt.Errorf("send: %w", err)

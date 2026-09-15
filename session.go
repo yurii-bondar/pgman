@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -52,6 +55,30 @@ type backendConn struct {
 	addr      string
 	pid       uint32
 	secretKey []byte
+
+	// stateOwner is the id of the session whose session-level state this
+	// connection currently carries: its GUCs, prepared statements, temp
+	// tables, advisory locks. 0 means freshly dialed — it carries
+	// nobody's.
+	//
+	// This is what lets the proxy skip server_reset_query. A scrub
+	// exists to isolate one client from another; running it between two
+	// transactions of the SAME session protects nobody, and with a LIFO
+	// pool a serial client gets its own connection back nearly every
+	// time. Compared at Acquire, where the next owner is finally known.
+	stateOwner uint64
+
+	// cancelTLS is the TLS configuration a CancelRequest for this
+	// backend must use. Non-nil exactly when the backend connection
+	// itself was established over TLS.
+	//
+	// A cancel does not travel on this connection: the protocol
+	// requires a brand-new one, which therefore has to repeat the TLS
+	// negotiation from scratch. Without this the cancel dial was always
+	// plaintext, so a backend with sslmode=require — the configuration
+	// this project's own sample config recommends — refused it, and
+	// query cancellation silently did nothing.
+	cancelTLS *tls.Config
 }
 
 // session tracks one client's fake identity (the BackendKeyData we
@@ -67,6 +94,16 @@ type trackedParam struct {
 }
 
 type session struct {
+	// id is a process-unique, monotonic session identity, used to match
+	// a session against backendConn.stateOwner. Distinct from the fake
+	// PID handed to the client: that one is random (it is a cancel-key
+	// component) and could in principle repeat.
+	//
+	// Zero means "not yet issued" — a session built outside
+	// registerSession. adoptBackend assigns one lazily before the id is
+	// ever compared, so no two sessions can look alike to stateOwner.
+	id uint64
+
 	secret      []byte
 	user        string
 	database    string
@@ -96,6 +133,19 @@ type session struct {
 	// lazy-Parse replay against fresh backends. See prepared_stmts.go
 	// for the full protocol. Nil until the client's first Parse.
 	psCache psCache
+
+	// psLimit caps len(psCache); <= 0 means uncapped. Copied from
+	// max_prepared_statements at startup so the per-message hot path
+	// reads one int off the session instead of reaching for
+	// runtimeOpts.
+	psLimit int
+	// psClock is a monotonic counter stamped into prepStmtInfo.lastUsed
+	// to order eviction. Session-local and single-goroutine (only the
+	// relay loop touches it), so a plain uint64 needs no atomics.
+	psClock uint64
+	// psEvicted trips on the first eviction so the operator gets one
+	// warning per session rather than one per statement.
+	psEvicted bool
 
 	// listenWarned trips true after we've logged the one-shot
 	// "LISTEN in transaction pooling won't deliver NOTIFY" warning
@@ -153,6 +203,12 @@ func (r *sessionRegistry) shardFor(pid uint32) *sessionShard {
 // existing tests) don't have to plumb a *sessionRegistry through.
 var globalSessions = newSessionRegistry()
 
+// nextSessionID issues session.id values. A plain counter, not random:
+// it is never sent to a client, it only has to be unique within this
+// process, and uniqueness is exactly what the stateOwner comparison
+// needs to be sound.
+var nextSessionID atomic.Uint64
+
 // randUint32 reads 4 bytes of crypto/rand as a uint32. crypto/rand
 // failure means the OS entropy source is broken — panic loudly.
 func randUint32() uint32 {
@@ -193,7 +249,13 @@ func registerSession(user, database string) (pid uint32, sess *session) {
 			continue
 		}
 		secret := randSecret()
-		sess = &session{secret: secret, user: user, database: database, connectedAt: time.Now()}
+		sess = &session{
+			id:          nextSessionID.Add(1), // starts at 1; 0 stays reserved for "unknown"
+			secret:      secret,
+			user:        user,
+			database:    database,
+			connectedAt: time.Now(),
+		}
 		shard.sessions[p] = sess
 		shard.mu.Unlock()
 		return p, sess
@@ -274,7 +336,7 @@ func cancelSession(pid uint32) error {
 	if backend == nil {
 		return fmt.Errorf("session %d has no in-flight transaction to cancel", pid)
 	}
-	return sendRealCancelRequest(backend.addr, backend.pid, backend.secretKey)
+	return sendRealCancelRequest(backend.addr, backend.pid, backend.secretKey, backend.cancelTLS)
 }
 
 // handleCancelRequest looks up which session owns the fake PID a
@@ -301,19 +363,79 @@ func handleCancelRequest(m *pgproto3.CancelRequest) {
 // connection real Postgres expects a CancelRequest on, and closes it
 // immediately. Uses a bounded dial timeout: a slow or unreachable
 // backend must never hang the caller (see cancelDialTimeout).
-func sendRealCancelRequest(addr string, pid uint32, secretKey []byte) error {
+//
+// tlsCfg mirrors how the backend connection being cancelled was
+// established. Nil means plaintext; non-nil means the fresh connection
+// must negotiate TLS before the CancelRequest goes out, because a
+// server running with ssl on and hostssl rules will otherwise drop it
+// on the floor.
+func sendRealCancelRequest(addr string, pid uint32, secretKey []byte, tlsCfg *tls.Config) error {
 	conn, err := net.DialTimeout("tcp", addr, cancelDialTimeout)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	_ = conn.SetWriteDeadline(time.Now().Add(cancelDialTimeout))
+	// One deadline for the whole exchange, set before the TLS wrap so
+	// it covers the handshake too — tls.Conn reads and writes through
+	// this same socket.
+	_ = conn.SetDeadline(time.Now().Add(cancelDialTimeout))
+
+	// stream, not conn: startCancelTLS returns nil on failure, and
+	// assigning that back over conn would hand the deferred Close a nil
+	// interface. The defer must keep pointing at the socket we dialed,
+	// which is also what actually tears the TLS session down — a
+	// fire-and-forget cancel has no use for a close_notify.
+	stream := conn
+	if tlsCfg != nil {
+		tlsConn, err := startCancelTLS(conn, tlsCfg)
+		if err != nil {
+			return err
+		}
+		stream = tlsConn
+	}
 
 	buf, err := (&pgproto3.CancelRequest{ProcessID: pid, SecretKey: secretKey}).Encode(nil)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
-	_, err = conn.Write(buf)
+	_, err = stream.Write(buf)
 	return err
+}
+
+// startCancelTLS performs the client half of Postgres's TLS negotiation
+// on a freshly dialed cancel connection: send SSLRequest, read the
+// single-byte verdict, hand over to TLS on 'S'.
+//
+// Written out here because pgproto3 models this exchange only from the
+// server's side (receiveStartupMessage is the mirror image), and pgconn
+// — which does have a client implementation — cannot be used: it insists
+// on completing a full startup handshake, and a cancel connection never
+// gets one.
+func startCancelTLS(conn net.Conn, cfg *tls.Config) (net.Conn, error) {
+	req, err := (&pgproto3.SSLRequest{}).Encode(nil)
+	if err != nil {
+		return nil, fmt.Errorf("encode sslrequest: %w", err)
+	}
+	if _, err := conn.Write(req); err != nil {
+		return nil, fmt.Errorf("send sslrequest: %w", err)
+	}
+
+	var verdict [1]byte
+	if _, err := io.ReadFull(conn, verdict[:]); err != nil {
+		return nil, fmt.Errorf("read sslrequest reply: %w", err)
+	}
+	if verdict[0] != 'S' {
+		// Never fall back to plaintext. The backend connection this
+		// cancel belongs to is encrypted, so downgrading would put the
+		// cancel key on the wire in the clear — and the server that
+		// just refused TLS is not going to honour the request anyway.
+		return nil, fmt.Errorf("backend refused TLS on the cancel connection (replied %q)", verdict[0])
+	}
+
+	tlsConn := tls.Client(conn, cfg)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("cancel tls handshake: %w", err)
+	}
+	return tlsConn, nil
 }

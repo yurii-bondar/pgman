@@ -30,16 +30,34 @@
 package main
 
 import (
+	"log/slog"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
+
+// defaultMaxPreparedStatements caps how many named statements one
+// session may have tracked at a time. Matches PgBouncer's
+// max_prepared_statements default.
+//
+// A cap is not optional. Every entry holds the statement's full SQL
+// text, the client chooses both the name and how many to create, and
+// max_client_conn defaults to 10000 — so without one, a single client
+// looping over fresh statement names is an out-of-memory primitive that
+// needs no privileges beyond connecting.
+const defaultMaxPreparedStatements = 200
 
 // prepStmtInfo is what the proxy needs to replay a Parse on any
 // backend that hasn't seen a given prepared statement yet.
 type prepStmtInfo struct {
 	SQL           string
 	ParameterOIDs []uint32
+
+	// lastUsed orders eviction. Stamped from session.psClock on Parse
+	// and on every Bind/Describe that finds this entry, so the cap
+	// sheds the statements a client has stopped using rather than the
+	// ones it is using right now.
+	lastUsed uint64
 }
 
 // psCache is the per-session prepared statement registry — keyed by
@@ -122,15 +140,70 @@ func trackClientParse(backend *backendConn, sess *session, m *pgproto3.Parse) {
 	if sess.psCache == nil {
 		sess.psCache = make(psCache)
 	}
+	if _, replacing := sess.psCache[m.Name]; !replacing {
+		evictPreparedStmts(backend, sess)
+	}
+	sess.psClock++
 	sess.psCache[m.Name] = &prepStmtInfo{
 		SQL:           m.Query,
 		ParameterOIDs: append([]uint32(nil), m.ParameterOIDs...),
+		lastUsed:      sess.psClock,
 	}
 	if backend != nil {
 		if backend.preparedStmts == nil {
 			backend.preparedStmts = make(backendPSCache)
 		}
 		backend.preparedStmts[m.Name] = struct{}{}
+	}
+}
+
+// evictPreparedStmts makes room for one more entry, dropping the least
+// recently used statements until the cache is under sess.psLimit.
+//
+// Dropping an entry is safe, not a broken session: the next Bind for
+// that name simply forwards unchanged. If the current backend still
+// holds the statement it runs normally, and if it doesn't, Postgres
+// answers 26000 "prepared statement does not exist" — which is exactly
+// what every driver with its own statement cache (pgx, JDBC) already
+// handles by re-issuing the Parse. Refusing the Parse instead would
+// break the statement the client just asked for, i.e. the hottest one.
+//
+// The scan is O(len(cache)) but runs only when the cache is full, at a
+// default cap of 200. A list-plus-map LRU would turn a 12-line function
+// into a data structure for no measurable gain at that size.
+func evictPreparedStmts(backend *backendConn, sess *session) {
+	limit := sess.psLimit
+	if limit <= 0 {
+		return // negative or unset ⇒ no cap (see max_prepared_statements)
+	}
+	for len(sess.psCache) >= limit {
+		var oldestName string
+		var oldestUse uint64
+		for name, info := range sess.psCache {
+			if oldestName == "" || info.lastUsed < oldestUse {
+				oldestName, oldestUse = name, info.lastUsed
+			}
+		}
+		if oldestName == "" {
+			return
+		}
+		delete(sess.psCache, oldestName)
+		// Forget it on the backend too. The backend really does still
+		// hold the statement, but we can no longer replay it anywhere
+		// else, so the entry is dead weight — and in session pooling,
+		// where the backend is never released, dead weight that never
+		// gets collected.
+		if backend != nil && backend.preparedStmts != nil {
+			delete(backend.preparedStmts, oldestName)
+		}
+		if !sess.psEvicted {
+			sess.psEvicted = true
+			slog.Warn("prepared-statement cache full, evicting least recently used",
+				"limit", limit,
+				"user", sess.user,
+				"database", sess.database,
+				"hint", "raise max_prepared_statements, or lower the client driver's own statement-cache size")
+		}
 	}
 }
 
@@ -168,8 +241,12 @@ func ensureBackendHasStmt(
 	}
 	info, ok := sess.psCache[stmtName]
 	if !ok {
-		return msg, 0 // we've never seen a Parse for this name — client bug or backend-side stmt
+		return msg, 0 // we've never seen a Parse for this name — client bug, evicted, or backend-side stmt
 	}
+	// Touch it: this statement is in active use and must outrank the
+	// ones that are only sitting in the cache when the cap bites.
+	sess.psClock++
+	info.lastUsed = sess.psClock
 	if backend == nil {
 		return msg, 0
 	}
@@ -258,11 +335,19 @@ func invalidatePSCachesOnDDL(backend *backendConn, sess *session) {
 	clearBackendPSCache(backend)
 }
 
-// clearBackendPSCache is called right after a serverResetQuery runs
-// ("DISCARD ALL" wipes all prepared statements on the backend), so the
-// cache no longer reflects reality. Skipping this would leave stale
-// entries saying "backend knows S" when it doesn't, causing the very
-// "does not exist" errors this whole machinery exists to avoid.
+// clearBackendPSCache drops a backend's record of which statements it
+// has been shown. Called on every release of a backend out of a session
+// (see relayImpl's release), and on DDL.
+//
+// Two distinct reasons, both load-bearing:
+//
+//   - "DISCARD ALL" wipes every prepared statement on the backend, so
+//     keeping entries that say "backend knows S" produces exactly the
+//     "does not exist" errors this machinery exists to avoid.
+//   - Statement names are chosen per client. Without the reset query
+//     the statements survive, and a stale entry lets the NEXT session's
+//     Bind for a colliding name run the previous client's statement
+//     instead of its own.
 func clearBackendPSCache(b *backendConn) {
 	if b == nil {
 		return

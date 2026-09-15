@@ -25,6 +25,13 @@ tls_key_file: "certs/server.key"
 auth_users:
   rgs: "SCRAM-SHA-256$4096:PDleUJSqWGThS77n6IaYiQ==$suBycl9o9+u6tHTq5XCcL9ZepPhAut3KA/Dtdi1wgOM=:zUnH1fzQ1MM7+8Lru2+voRbOK5s8OKumgunqoyfrq5E="
 
+# Roles allowed into the PgBouncer-compatible admin console (the virtual
+# `admin_database`, default "pgbouncer"). Empty ⇒ nobody, which is the
+# default: that console can PAUSE every pool and SHOW CLIENTS lists every
+# tenant's sessions, so passing client auth must not be enough to reach it.
+# admin_users:
+#   - ops
+
 # ---- Admin-facing auth (HTTP admin UI) -------------------------------------
 
 # Required whenever admin_addr is bound to a non-loopback interface.
@@ -66,6 +73,35 @@ max_client_conn: 10000                      # cap on concurrent client conns (0 
 client_login_timeout: "60s"                 # startup+auth deadline; defends against slowloris
 query_wait_timeout: "120s"                  # max Acquire wait on saturated pool
 server_reset_query: "DISCARD ALL"           # session-state scrub between clients
+
+# Skip the scrub when the pool hands a connection straight back to the
+# session that just released it. Saves two round trips per transaction (the
+# DISCARD, plus the tracked-parameter replay that restores what it wiped),
+# and with a LIFO pool a serial client hits this case almost every time.
+#
+# Off by default, and the cost is determinism rather than isolation — a
+# different client never sees another's state either way. With it on, a
+# session-level SET survives into the next transaction whenever the pool
+# returns the same connection and is lost when it doesn't, so an app can
+# appear to get away with session state until load starts moving
+# connections between clients. Turn it on when your clients treat each
+# transaction as independent, which transaction pooling asks of them anyway.
+#
+# Where it pays: the skip only fires when a session gets its own connection
+# back, so the win shrinks as clients oversubscribe the pool. Measured on a
+# laptop against a Docker Postgres (15s runs, pool=50): +72% QPS with one
+# serial client, +18% at 4 clients, +13% at 20, and nothing measurable at
+# 100 — there a released connection is taken by a waiter before its owner
+# can reacquire it.
+server_reset_query_skip_same_session: false
+
+# Cap on named prepared statements tracked per client session. Every entry
+# holds the statement's full SQL text, and the client chooses both the names
+# and how many — so an uncapped cache is an OOM primitive. Past the cap the
+# least recently used entry is dropped; the client re-Parses on the next miss.
+# Budget roughly: cap x average statement size x max_client_conn.
+max_prepared_statements: 200                # 0 = default (200), negative = no cap
+
 tcp_keepalive: "30s"                        # detect vanished peers instead of leaking FDs
 
 # The three session timeouts. All default to 0 (disabled), matching
@@ -130,6 +166,41 @@ pools:
     backend_addr: "localhost:5432"
     limit: 20
     min_idle: 2                             # keep 2 conns warm at all times
+
+    # Give individual roles their own backend credentials, so a client
+    # authenticated as alice also runs as alice on Postgres. Without this
+    # every client shares the backend_dsn role whatever it logged in as,
+    # and GRANT/REVOKE, row-level security and pg_stat_activity all stop
+    # telling your clients apart.
+    #
+    # Pools are keyed by the identity they dial with: users listed here
+    # each get their own pool (visible as "backoffice/alice" in metrics
+    # and SHOW POOLS), everyone else keeps sharing the backend_dsn one.
+    # Budget a pool per listed user, each up to `limit` connections.
+    #
+    # A full DSN, not a password, so the secret need not live in this
+    # file: use passfile= for a .pgpass, or sslcert=/sslkey= for
+    # certificate auth with no password at all.
+    # backend_users:
+    #   alice: "postgres://alice@localhost:5432/backoffice?sslmode=verify-full&passfile=/etc/pgman/pgpass"
+
+    # Or let every client bring its own credential. With scram_passthrough
+    # the ClientKey recovered from a client's SCRAM handshake with pgman is
+    # reused to authenticate to Postgres as that same role — nothing to
+    # configure per user, nothing on disk, and users resolved through
+    # auth_query are covered too.
+    #
+    # Requires pgman's verifier for a user to be the backend's verifier,
+    # because ClientKey derives from its salt and iteration count. Copying
+    # rolpassword into auth_users (as above) or pointing auth_query at this
+    # backend's pg_shadow makes that automatic; anything else fails with a
+    # message saying so.
+    #
+    # The cost: pgman then keeps a password-equivalent in memory for every
+    # user that has logged in, instead of only verifiers. Clients using
+    # trust, peer or cert auth have no ClientKey and keep sharing the
+    # backend_dsn role.
+    # scram_passthrough: true
     # idle_timeout, max_lifetime, etc. inherit top-level defaults unless set here
 
   analytics:

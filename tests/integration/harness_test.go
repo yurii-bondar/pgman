@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -300,12 +301,28 @@ health_check_timeout: 500ms
 log_format: text
 log_level: info
 allow_insecure_trust_auth: true
-pools:
+admin_users:
+  - admin
+%spools:
   pgman_test:
     backend_dsn: %q
     backend_addr: %q
     limit: %d
-%s`, proxyPort, metricsPort, adminPort, resetQuery, pgDSN, pgAddrFromDSN2(pgDSN), poolLimit, modeLine)
+%s`, proxyPort, metricsPort, adminPort, resetQuery, extraConfig(), pgDSN, pgAddrFromDSN2(pgDSN), poolLimit, modeLine)
+}
+
+// extraConfig appends verbatim top-level YAML from PGMAN_TEST_EXTRA_CONFIG.
+// It exists so a benchmark run can flip one knob — comparing the same
+// binary against itself — without a harness entry point per option.
+func extraConfig() string {
+	extra := os.Getenv("PGMAN_TEST_EXTRA_CONFIG")
+	if extra == "" {
+		return ""
+	}
+	if !strings.HasSuffix(extra, "\n") {
+		extra += "\n"
+	}
+	return extra
 }
 
 // startProxyWithMode is startProxy with a custom pool_mode.

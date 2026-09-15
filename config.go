@@ -101,6 +101,18 @@ type Config struct {
 	// existing dashboards. Set to "" to disable admin SQL entirely.
 	AdminDatabase string `yaml:"admin_database"`
 
+	// AdminUsers lists the client usernames allowed into that console.
+	// Mirrors PgBouncer's admin_users, and exists for the same reason:
+	// passing client auth proves who you are, not that you may PAUSE
+	// every pool on the proxy or read every other tenant's session list
+	// out of SHOW CLIENTS.
+	//
+	// Empty (the default) denies everyone — a client naming
+	// AdminDatabase then gets the same "database is not configured"
+	// answer as any other unknown name, so the console isn't
+	// discoverable by probing.
+	AdminUsers []string `yaml:"admin_users"`
+
 	// AuthHBAFile is the path to a PgBouncer/Postgres-style host-based
 	// authentication file. When set, every incoming client connection
 	// is matched against rules in order (first match wins). Method
@@ -198,6 +210,19 @@ type Config struct {
 	// unset AppNameTracking (not exposed — see applyDefaults).
 	TrackExtraParameters []string `yaml:"track_extra_parameters"`
 
+	// MaxPreparedStatements caps how many named prepared statements the
+	// proxy tracks per client session, so that transaction-mode replay
+	// cannot be turned into unbounded memory growth by a client that
+	// keeps inventing statement names. Mirrors PgBouncer's key of the
+	// same name; 0 takes the default (200), negative disables the cap.
+	//
+	// Past the cap the least recently used entry is dropped. Set this
+	// at or above the statement-cache size of your driver (pgx defaults
+	// to 512) if you want replay to never miss — and budget for it:
+	// the worst case is roughly cap × average statement size ×
+	// max_client_conn.
+	MaxPreparedStatements int `yaml:"max_prepared_statements"`
+
 	// ---- Limits & timeouts (data plane) -----------------------------
 
 	// MaxClientConn caps the total concurrent client connections
@@ -272,6 +297,30 @@ type Config struct {
 	// Mirrors PgBouncer's server_reset_query.
 	ServerResetQuery string `yaml:"server_reset_query"`
 
+	// ServerResetQuerySkipSameSession stops running ServerResetQuery
+	// when the pool hands a connection straight back to the session that
+	// just released it. Off by default.
+	//
+	// The win is two round trips per transaction: that scrub isolates a
+	// session from itself, and the tracked-parameter replay then has to
+	// restore what it just wiped. With a LIFO pool and a serial client
+	// it is also the common case, not the rare one.
+	//
+	// It is off by default despite that, because it is not free. What
+	// it costs is not isolation — a different client never sees another
+	// one's state either way, see adoptBackend — but determinism. With
+	// it on, a session-level SET survives into the next transaction
+	// whenever the pool happens to return the same connection and is
+	// lost when it does not. An application can then appear to get away
+	// with session state in transaction pooling right up until load
+	// starts moving connections between clients, which is the worst
+	// shape a bug can have.
+	//
+	// Turn it on when you know your clients treat each transaction as
+	// independent, which is what transaction pooling asks of them
+	// anyway.
+	ServerResetQuerySkipSameSession bool `yaml:"server_reset_query_skip_same_session"`
+
 	// TCPKeepAlive interval on both accepted client sockets and dialed
 	// backend sockets — detects and evicts dead peers instead of
 	// leaking them until the OS FIN-timeout fires. 0 uses OS default.
@@ -316,6 +365,46 @@ type PoolConfig struct {
 	BackendDSN  string `yaml:"backend_dsn"`
 	BackendAddr string `yaml:"backend_addr"`
 	Limit       int    `yaml:"limit"`
+	// BackendUsers gives individual client roles their own backend
+	// credentials, so that a client authenticated as alice also runs as
+	// alice on Postgres. Keys are client usernames; values are complete
+	// DSNs, used in place of BackendDSN for that user's connections.
+	//
+	// Without this, every client shares BackendDSN's role no matter who
+	// they authenticated as, which is PgBouncer's forced-user mode
+	// (`user=` on a database) and has the same consequence: GRANT and
+	// REVOKE stop distinguishing your clients, row-level security sees
+	// one identity, and pg_stat_activity attributes every statement to
+	// the same role.
+	//
+	// A full DSN rather than a password so the credential need not sit
+	// in this file at all: point it at a .pgpass with `passfile=`, or
+	// use certificate auth with `sslcert=`/`sslkey=` and no password.
+	//
+	// Pools are keyed by the identity they actually use on the backend,
+	// so users listed here each get their own pool and everyone else
+	// keeps sharing the BackendDSN one. Budget for it: a pool per
+	// listed user, each up to Limit connections.
+	BackendUsers map[string]string `yaml:"backend_users"`
+
+	// ScramPassthrough opens each client's backend connections under
+	// that client's own role, reusing the ClientKey recovered from its
+	// SCRAM handshake with pgman. No per-user credential is configured
+	// or stored on disk, and users resolved through auth_query are
+	// covered too — which is what backend_users cannot do.
+	//
+	// Requires the verifier pgman holds for a user to be the same one
+	// the backend holds, because ClientKey is derived from its salt and
+	// iteration count. Copy rolpassword into auth_users, or point
+	// auth_query at this backend's pg_shadow, and that is automatic.
+	//
+	// The cost is that pgman keeps a password-equivalent in memory for
+	// every user that has logged in, where otherwise it keeps only
+	// verifiers. See clientKeyStore. Clients that authenticate by some
+	// other method — trust, peer, cert — have no ClientKey to reuse and
+	// keep sharing the BackendDSN role.
+	ScramPassthrough bool `yaml:"scram_passthrough"`
+
 	// Aliases are extra client-visible database names that route to
 	// this pool. The primary building block for r/w split (an "app_ro"
 	// alias on a replica pool sends read-only clients to replicas
@@ -378,6 +467,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxClientConn == 0 {
 		c.MaxClientConn = 10_000
+	}
+	if c.MaxPreparedStatements == 0 {
+		c.MaxPreparedStatements = defaultMaxPreparedStatements
 	}
 	if c.ClientLoginTimeout == 0 {
 		c.ClientLoginTimeout = 60 * time.Second
@@ -520,6 +612,17 @@ func loadConfig(path string) (*Config, error) {
 			"query_wait_timeout", cfg.QueryWaitTimeout)
 	}
 
+	// Not an error: disabling the console is a legitimate stance, and
+	// making it fatal would break every config that predates
+	// admin_users. But silently losing SHOW POOLS after an upgrade is
+	// the kind of thing an operator discovers mid-incident.
+	if cfg.AdminDatabase != "" && len(cfg.AdminUsers) == 0 {
+		slog.Warn("config: admin_database is set but admin_users is empty — "+
+			"the PgBouncer-compatible admin console is disabled",
+			"admin_database", cfg.AdminDatabase,
+			"fix", "list the operator roles in admin_users, or set admin_database: \"\" to disable explicitly")
+	}
+
 	if len(cfg.AuthUsers) == 0 && !cfg.AllowInsecureTrustAuth {
 		return nil, fmt.Errorf("%s: no auth_users configured — set at least one, or explicitly set allow_insecure_trust_auth: true to accept every client unauthenticated", path)
 	}
@@ -565,6 +668,24 @@ func loadConfig(path string) (*Config, error) {
 		}
 		if pc.Limit <= 0 {
 			return nil, fmt.Errorf("%s: pool %q: limit must be positive, got %d", path, name, pc.Limit)
+		}
+		// Registry keys are "<pool>/<backend user>", so a slash in
+		// either half could make two different pools collide on one
+		// key — and a routing collision is a client reaching the wrong
+		// database. Cheap to forbid, impossible to debug if allowed.
+		if strings.Contains(name, poolKeySeparator) {
+			return nil, fmt.Errorf("%s: pool name %q must not contain %q", path, name, poolKeySeparator)
+		}
+		for user, dsn := range pc.BackendUsers {
+			if user == "" {
+				return nil, fmt.Errorf("%s: pool %q: backend_users has an empty username", path, name)
+			}
+			if strings.Contains(user, poolKeySeparator) {
+				return nil, fmt.Errorf("%s: pool %q: backend_users key %q must not contain %q", path, name, user, poolKeySeparator)
+			}
+			if dsn == "" {
+				return nil, fmt.Errorf("%s: pool %q: backend_users[%q] has an empty DSN", path, name, user)
+			}
 		}
 	}
 

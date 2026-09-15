@@ -55,18 +55,21 @@ func NewDatabaseRouter(registry *PoolRegistry) *DatabaseRouter {
 
 func (r *DatabaseRouter) Route(startup *pgproto3.StartupMessage) (RouteDecision, error) {
 	db := startup.Parameters["database"]
-	p, ok := r.registry.Get(db)
+	// The user is half the pool key, not just an auth detail: a client
+	// with its own backend credentials must not be handed a connection
+	// opened under somebody else's role.
+	user := startup.Parameters["user"]
+	key, p, cfg, ok := r.registry.Resolve(db, user)
 	if !ok {
 		return RouteDecision{}, fmt.Errorf("database %q is not configured on this proxy", db)
 	}
-	cfg, _ := r.registry.PoolConfig(db)
 	mode := strings.ToLower(cfg.PoolMode)
 	if mode == "" {
 		mode = "transaction"
 	}
 	return RouteDecision{
 		Pool:        p,
-		PoolName:    r.registry.ResolveName(db),
+		PoolName:    key,
 		PoolMode:    mode,
 		SessionMode: mode == "session",
 	}, nil

@@ -92,7 +92,7 @@ func applyConfigReload(configPath string, registry *PoolRegistry) (ReloadResult,
 			continue
 		}
 		result.Removed = append(result.Removed, name)
-		go drainInBackground(name, old)
+		drainPoolsInBackground(name, old)
 	}
 
 	if len(errs) > 0 {
