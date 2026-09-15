@@ -25,6 +25,13 @@ tls_key_file: "certs/server.key"
 auth_users:
   rgs: "SCRAM-SHA-256$4096:PDleUJSqWGThS77n6IaYiQ==$suBycl9o9+u6tHTq5XCcL9ZepPhAut3KA/Dtdi1wgOM=:zUnH1fzQ1MM7+8Lru2+voRbOK5s8OKumgunqoyfrq5E="
 
+# Roles allowed into the PgBouncer-compatible admin console (the virtual
+# `admin_database`, default "pgbouncer"). Empty ⇒ nobody, which is the
+# default: that console can PAUSE every pool and SHOW CLIENTS lists every
+# tenant's sessions, so passing client auth must not be enough to reach it.
+# admin_users:
+#   - ops
+
 # ---- Admin-facing auth (HTTP admin UI) -------------------------------------
 
 # Required whenever admin_addr is bound to a non-loopback interface.

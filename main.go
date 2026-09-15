@@ -60,6 +60,12 @@ type runtimeOpts struct {
 	// sees the live set.
 	adminSession func(pg *pgproto3.Backend)
 
+	// adminUsers is the set of client usernames allowed into that
+	// console. A nil/empty set denies everyone — admin SQL is opt-in,
+	// because the alternative (any authenticated client) hands every
+	// tenant a PAUSE that takes the whole proxy down.
+	adminUsers map[string]bool
+
 	// trackExtraParams is the whitelist of client StartupMessage
 	// RuntimeParams to replay on every new backend Acquire (transaction
 	// mode). Order matters — some GUCs depend on others being set first.
@@ -111,12 +117,30 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		maxClientConn:    cfg.MaxClientConn,
 		metrics:          metrics,
 		adminDatabase:    cfg.AdminDatabase,
+		adminUsers:       adminUserSet(cfg.AdminUsers),
 		trackExtraParams: cfg.TrackExtraParameters,
 		// adminSession is wired up by main() where the registry is
 		// available. Left nil here so plain runtimeOptsFromConfig
 		// callers (tests) don't accidentally enable admin SQL without
 		// providing a registry.
 	}
+}
+
+// adminUserSet turns the configured admin_users list into the lookup
+// the startup path uses. Returns nil for an empty list, which reads as
+// "deny everyone" — a nil map lookup is false, so the caller needs no
+// separate nil check.
+func adminUserSet(users []string) map[string]bool {
+	if len(users) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(users))
+	for _, u := range users {
+		if u != "" {
+			set[u] = true
+		}
+	}
+	return set
 }
 
 func main() {
@@ -843,25 +867,43 @@ func handleConnWithOpts(client net.Conn, router Router, authBackend AuthBackend,
 		// virtual admin database, don't route — run our in-process
 		// SHOW / PAUSE / RESUME / RECONNECT handler and never touch a
 		// real Postgres.
-		if opts.adminDatabase != "" && opts.adminSession != nil &&
-			m.Parameters["database"] == opts.adminDatabase {
-			slog.Info("startup: admin session",
-				"user", m.Parameters["user"],
-				"database", m.Parameters["database"])
-			if opts.metrics != nil {
-				opts.metrics.ClientLoginOK.Inc()
-			}
-			pid, sess := registerSession(m.Parameters["user"], m.Parameters["database"])
-			defer deregisterSession(pid)
-			if err := fakeAuth(pg, pid, sess.secret); err != nil {
-				slog.Warn("admin: fake auth", "err", err)
+		//
+		// Passing client auth is NOT enough to get in here. The console
+		// can PAUSE every pool (a total outage issued by any tenant)
+		// and SHOW CLIENTS lists every other tenant's user/database, so
+		// it needs its own allowlist on top — PgBouncer's admin_users.
+		if opts.adminDatabase != "" && m.Parameters["database"] == opts.adminDatabase {
+			if opts.adminSession != nil && opts.adminUsers[m.Parameters["user"]] {
+				slog.Info("startup: admin session",
+					"user", m.Parameters["user"],
+					"database", m.Parameters["database"])
+				if opts.metrics != nil {
+					opts.metrics.ClientLoginOK.Inc()
+				}
+				pid, sess := registerSession(m.Parameters["user"], m.Parameters["database"])
+				defer deregisterSession(pid)
+				if err := fakeAuth(pg, pid, sess.secret); err != nil {
+					slog.Warn("admin: fake auth", "err", err)
+					return
+				}
+				if opts.clientLoginTimeout > 0 {
+					_ = client.SetDeadline(time.Time{})
+				}
+				opts.adminSession(pg)
 				return
 			}
-			if opts.clientLoginTimeout > 0 {
-				_ = client.SetDeadline(time.Time{})
-			}
-			opts.adminSession(pg)
-			return
+			// Not authorised. Deliberately no distinct error: fall
+			// through to routing, which answers exactly as it would for
+			// any other unconfigured database name. A dedicated
+			// "not an admin" reply would confirm the console exists and
+			// hand an attacker a probe for which users are admins.
+			slog.Warn("startup: admin console denied",
+				"user", m.Parameters["user"],
+				"database", m.Parameters["database"],
+				"reason", "user is not listed in admin_users")
+			auditLog("admin_denied",
+				"user", m.Parameters["user"],
+				"database", m.Parameters["database"])
 		}
 
 		decision, err := router.Route(m)

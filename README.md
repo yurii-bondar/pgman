@@ -145,6 +145,18 @@ SHOW DATABASES · SHOW LISTS · SHOW VERSION
 PAUSE [pool] · RESUME [pool] · RECONNECT [pool]
 ```
 
+The console is restricted to the roles listed in `admin_users`, and the
+list is empty by default — passing client auth proves who you are, not
+that you may `PAUSE` every pool or read every other tenant's session
+list. A client that is not on the list gets the same
+`database "pgbouncer" is not configured` answer as any other unknown
+database name, so the console cannot be found by probing.
+
+```yaml
+admin_users:
+  - ops
+```
+
 ### Admin UI
 
 `admin_addr` serves a read-mostly dashboard (pool sizes, in-use, idle,

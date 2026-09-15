@@ -101,6 +101,18 @@ type Config struct {
 	// existing dashboards. Set to "" to disable admin SQL entirely.
 	AdminDatabase string `yaml:"admin_database"`
 
+	// AdminUsers lists the client usernames allowed into that console.
+	// Mirrors PgBouncer's admin_users, and exists for the same reason:
+	// passing client auth proves who you are, not that you may PAUSE
+	// every pool on the proxy or read every other tenant's session list
+	// out of SHOW CLIENTS.
+	//
+	// Empty (the default) denies everyone — a client naming
+	// AdminDatabase then gets the same "database is not configured"
+	// answer as any other unknown name, so the console isn't
+	// discoverable by probing.
+	AdminUsers []string `yaml:"admin_users"`
+
 	// AuthHBAFile is the path to a PgBouncer/Postgres-style host-based
 	// authentication file. When set, every incoming client connection
 	// is matched against rules in order (first match wins). Method
@@ -518,6 +530,17 @@ func loadConfig(path string) (*Config, error) {
 			"finish within the shutdown budget",
 			"shutdown_timeout", cfg.ShutdownTimeout,
 			"query_wait_timeout", cfg.QueryWaitTimeout)
+	}
+
+	// Not an error: disabling the console is a legitimate stance, and
+	// making it fatal would break every config that predates
+	// admin_users. But silently losing SHOW POOLS after an upgrade is
+	// the kind of thing an operator discovers mid-incident.
+	if cfg.AdminDatabase != "" && len(cfg.AdminUsers) == 0 {
+		slog.Warn("config: admin_database is set but admin_users is empty — "+
+			"the PgBouncer-compatible admin console is disabled",
+			"admin_database", cfg.AdminDatabase,
+			"fix", "list the operator roles in admin_users, or set admin_database: \"\" to disable explicitly")
 	}
 
 	if len(cfg.AuthUsers) == 0 && !cfg.AllowInsecureTrustAuth {
