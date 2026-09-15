@@ -693,6 +693,11 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 		if err != nil {
 			return nil, fmt.Errorf("hijack: %w", err)
 		}
+		cancelTLS, err := cancelTLSConfigFor(hijacked.Conn, parsed)
+		if err != nil {
+			_ = hijacked.Conn.Close()
+			return nil, err
+		}
 		return &backendConn{
 			Conn: hijacked.Conn,
 			addr: addr,
@@ -700,8 +705,31 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 			// v5's SecretKey is already []byte; the type change ripples
 			// through backendConn/session/sendRealCancelRequest.
 			secretKey: hijacked.SecretKey,
+			cancelTLS: cancelTLS,
 		}, nil
 	}
+}
+
+// cancelTLSConfigFor decides how a later CancelRequest for this backend
+// must be dialed. A cancel needs its own connection, so it has to repeat
+// whatever transport the original one negotiated.
+//
+// The established connection is the authority, not the DSN: sslmode
+// values like "prefer" decide per attempt, and only the resulting
+// net.Conn says which way it went. Returns nil for a plaintext backend.
+func cancelTLSConfigFor(conn net.Conn, parsed *pgconn.Config) (*tls.Config, error) {
+	if _, isTLS := conn.(*tls.Conn); !isTLS {
+		return nil, nil
+	}
+	if parsed == nil || parsed.TLSConfig == nil {
+		// The connection is encrypted but we cannot reconstruct how.
+		// Failing the dial is the only honest option: handing back a
+		// backend whose cancels are silently impossible is exactly the
+		// bug this field exists to fix, and falling back to a plaintext
+		// cancel would put the cancel key on the wire in the clear.
+		return nil, fmt.Errorf("backend negotiated TLS but the DSN exposes no TLS config to reuse for cancel requests")
+	}
+	return parsed.TLSConfig, nil
 }
 
 // firstToken returns everything after the last occurrence of sep in s

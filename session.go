@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sort"
@@ -52,6 +54,18 @@ type backendConn struct {
 	addr      string
 	pid       uint32
 	secretKey []byte
+
+	// cancelTLS is the TLS configuration a CancelRequest for this
+	// backend must use. Non-nil exactly when the backend connection
+	// itself was established over TLS.
+	//
+	// A cancel does not travel on this connection: the protocol
+	// requires a brand-new one, which therefore has to repeat the TLS
+	// negotiation from scratch. Without this the cancel dial was always
+	// plaintext, so a backend with sslmode=require — the configuration
+	// this project's own sample config recommends — refused it, and
+	// query cancellation silently did nothing.
+	cancelTLS *tls.Config
 }
 
 // session tracks one client's fake identity (the BackendKeyData we
@@ -287,7 +301,7 @@ func cancelSession(pid uint32) error {
 	if backend == nil {
 		return fmt.Errorf("session %d has no in-flight transaction to cancel", pid)
 	}
-	return sendRealCancelRequest(backend.addr, backend.pid, backend.secretKey)
+	return sendRealCancelRequest(backend.addr, backend.pid, backend.secretKey, backend.cancelTLS)
 }
 
 // handleCancelRequest looks up which session owns the fake PID a
@@ -314,19 +328,79 @@ func handleCancelRequest(m *pgproto3.CancelRequest) {
 // connection real Postgres expects a CancelRequest on, and closes it
 // immediately. Uses a bounded dial timeout: a slow or unreachable
 // backend must never hang the caller (see cancelDialTimeout).
-func sendRealCancelRequest(addr string, pid uint32, secretKey []byte) error {
+//
+// tlsCfg mirrors how the backend connection being cancelled was
+// established. Nil means plaintext; non-nil means the fresh connection
+// must negotiate TLS before the CancelRequest goes out, because a
+// server running with ssl on and hostssl rules will otherwise drop it
+// on the floor.
+func sendRealCancelRequest(addr string, pid uint32, secretKey []byte, tlsCfg *tls.Config) error {
 	conn, err := net.DialTimeout("tcp", addr, cancelDialTimeout)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	_ = conn.SetWriteDeadline(time.Now().Add(cancelDialTimeout))
+	// One deadline for the whole exchange, set before the TLS wrap so
+	// it covers the handshake too — tls.Conn reads and writes through
+	// this same socket.
+	_ = conn.SetDeadline(time.Now().Add(cancelDialTimeout))
+
+	// stream, not conn: startCancelTLS returns nil on failure, and
+	// assigning that back over conn would hand the deferred Close a nil
+	// interface. The defer must keep pointing at the socket we dialed,
+	// which is also what actually tears the TLS session down — a
+	// fire-and-forget cancel has no use for a close_notify.
+	stream := conn
+	if tlsCfg != nil {
+		tlsConn, err := startCancelTLS(conn, tlsCfg)
+		if err != nil {
+			return err
+		}
+		stream = tlsConn
+	}
 
 	buf, err := (&pgproto3.CancelRequest{ProcessID: pid, SecretKey: secretKey}).Encode(nil)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
-	_, err = conn.Write(buf)
+	_, err = stream.Write(buf)
 	return err
+}
+
+// startCancelTLS performs the client half of Postgres's TLS negotiation
+// on a freshly dialed cancel connection: send SSLRequest, read the
+// single-byte verdict, hand over to TLS on 'S'.
+//
+// Written out here because pgproto3 models this exchange only from the
+// server's side (receiveStartupMessage is the mirror image), and pgconn
+// — which does have a client implementation — cannot be used: it insists
+// on completing a full startup handshake, and a cancel connection never
+// gets one.
+func startCancelTLS(conn net.Conn, cfg *tls.Config) (net.Conn, error) {
+	req, err := (&pgproto3.SSLRequest{}).Encode(nil)
+	if err != nil {
+		return nil, fmt.Errorf("encode sslrequest: %w", err)
+	}
+	if _, err := conn.Write(req); err != nil {
+		return nil, fmt.Errorf("send sslrequest: %w", err)
+	}
+
+	var verdict [1]byte
+	if _, err := io.ReadFull(conn, verdict[:]); err != nil {
+		return nil, fmt.Errorf("read sslrequest reply: %w", err)
+	}
+	if verdict[0] != 'S' {
+		// Never fall back to plaintext. The backend connection this
+		// cancel belongs to is encrypted, so downgrading would put the
+		// cancel key on the wire in the clear — and the server that
+		// just refused TLS is not going to honour the request anyway.
+		return nil, fmt.Errorf("backend refused TLS on the cancel connection (replied %q)", verdict[0])
+	}
+
+	tlsConn := tls.Client(conn, cfg)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("cancel tls handshake: %w", err)
+	}
+	return tlsConn, nil
 }
