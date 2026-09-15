@@ -1162,6 +1162,18 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 		// read fail instantly, which is about as hard to diagnose as
 		// bugs get.
 		_ = backend.SetReadDeadline(time.Time{})
+		// The backend's prepared-statement set records which statements
+		// THIS session taught it, and statement names are per-client.
+		// It therefore must not survive the handover, whatever
+		// server_reset_query is set to: the next session's Bind for a
+		// name that happens to collide would find the backend "already
+		// knows" it, skip the lazy Parse, and silently execute the
+		// previous client's statement.
+		//
+		// Unconditional on purpose. Doing this only when
+		// server_reset_query is configured made correctness here a
+		// property of the config rather than of the code.
+		clearBackendPSCache(backend)
 		if reusable {
 			if opts.serverResetQuery != "" {
 				if err := runResetQuery(backend, opts.serverResetQuery, opts.healthCheckTimeout); err != nil {
@@ -1173,11 +1185,6 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 					sess.setBackend(nil)
 					return
 				}
-				// DISCARD ALL wipes every prepared statement on the
-				// backend — invalidate our tracking cache too, else
-				// the next Bind for a "known" stmt would skip the
-				// lazy Parse and error with "does not exist".
-				clearBackendPSCache(backend)
 			}
 			p.Release(backend)
 		} else {

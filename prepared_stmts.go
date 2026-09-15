@@ -335,11 +335,19 @@ func invalidatePSCachesOnDDL(backend *backendConn, sess *session) {
 	clearBackendPSCache(backend)
 }
 
-// clearBackendPSCache is called right after a serverResetQuery runs
-// ("DISCARD ALL" wipes all prepared statements on the backend), so the
-// cache no longer reflects reality. Skipping this would leave stale
-// entries saying "backend knows S" when it doesn't, causing the very
-// "does not exist" errors this whole machinery exists to avoid.
+// clearBackendPSCache drops a backend's record of which statements it
+// has been shown. Called on every release of a backend out of a session
+// (see relayImpl's release), and on DDL.
+//
+// Two distinct reasons, both load-bearing:
+//
+//   - "DISCARD ALL" wipes every prepared statement on the backend, so
+//     keeping entries that say "backend knows S" produces exactly the
+//     "does not exist" errors this machinery exists to avoid.
+//   - Statement names are chosen per client. Without the reset query
+//     the statements survive, and a stale entry lets the NEXT session's
+//     Bind for a colliding name run the previous client's statement
+//     instead of its own.
 func clearBackendPSCache(b *backendConn) {
 	if b == nil {
 		return
