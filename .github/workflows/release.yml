@@ -79,7 +79,11 @@ jobs:
       # Versions are pinned rather than left to npx's "latest", so a
       # release cut today and one cut in six months are produced by the
       # same tool. The conventionalcommits preset is a separate package
-      # from the plugins that reference it.
+      # from the plugins that reference it, and its major has to match
+      # the changelog writer semantic-release bundles: 25.x carries
+      # conventional-changelog-writer@8, which preset 10 refuses to
+      # render ("requires conventional-changelog-writer@9 or newer").
+      # Preset 9 is the one that pairs with it.
       - name: semantic-release
         if: steps.freshness.outputs.stale != 'true'
         env:
@@ -90,7 +94,7 @@ jobs:
             -p @semantic-release/changelog@7.0.0 \
             -p @semantic-release/git@11.0.1 \
             -p @semantic-release/github@12.0.9 \
-            -p conventional-changelog-conventionalcommits@10.4.0 \
+            -p conventional-changelog-conventionalcommits@9.3.1 \
             semantic-release
 
       # semantic-release has no output to read, so the tag it created is
