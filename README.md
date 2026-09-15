@@ -97,6 +97,7 @@ exists. The settings worth knowing up front:
 | `pools.<name>.pool_mode` | `transaction`, `session` or `statement`. | `transaction` |
 | `pools.<name>.limit` | Backend connections for this pool. | — |
 | `pools.<name>.backend_users` | Per-role backend DSNs; each gets its own pool. | — |
+| `pools.<name>.scram_passthrough` | Authenticate to Postgres as the client, reusing its SCRAM proof. | `false` |
 
 Each pool is defined under `pools:` with its own backend DSN and limit,
 and may expose `aliases` so several client-facing database names share
@@ -134,9 +135,53 @@ That is what PgBouncer does too: a pool per (database, user), collapsing
 to one per database when the definition forces a single user. Size for
 it: one pool per listed user, each up to `limit` connections.
 
-Users resolved through `auth_query` are not covered — per-user backend
-identity needs per-user backend credentials, and those have to be
-configured.
+#### SCRAM pass-through
+
+`backend_users` needs a DSN per role. `scram_passthrough` needs nothing
+per role at all:
+
+```yaml
+pools:
+  backoffice:
+    backend_dsn: "postgres://unused@db:5432/backoffice?sslmode=verify-full"
+    backend_addr: "db:5432"
+    limit: 20
+    scram_passthrough: true
+```
+
+When a client authenticates to pgman with SCRAM, the server half of that
+exchange recovers the client's `ClientKey` — the value a SCRAM *client*
+signs with. pgman reuses it to authenticate to Postgres as that same
+role. No backend password is configured, stored or transmitted, and
+users resolved through `auth_query` are covered, which `backend_users`
+cannot do. PgBouncer works the same way.
+
+Per-user pools appear on first use, since the credential does not exist
+until the client logs in, and are named `backoffice/alice` like any
+other. Only a completed SCRAM handshake can create one, so the set of
+pools is the set of real roles that have connected.
+
+Two conditions:
+
+- **pgman's verifier must be the backend's verifier.** `ClientKey`
+  derives from the salt and iteration count, so a verifier built
+  independently will not authenticate. Copy `rolpassword` from
+  `pg_authid` into `auth_users`, or point `auth_query` at that backend's
+  `pg_shadow`. A mismatch is reported as a mismatch, not as a wrong
+  password.
+- **The backend must ask for `scram-sha-256`.** `md5`, `password` and
+  GSSAPI cannot be answered with a `ClientKey`; the error names what was
+  asked for.
+
+Clients that authenticate by some other method — `trust`, `peer`,
+`cert` — have no `ClientKey` to reuse and keep sharing the
+`backend_dsn` role.
+
+The trade is where the credential lives. With pass-through pgman holds a
+password-equivalent in memory for every user that has logged in, where
+otherwise it holds only verifiers, which authenticate nowhere. That is
+still the better half of the bargain against a per-user password or
+passfile on disk — but it is a real change, which is why it is opt-in.
 
 ### Pool modes and what they cost you
 
@@ -283,12 +328,14 @@ Honest list, so nobody discovers these in an incident:
   away with session state until load starts moving connections between
   clients. Isolation between different clients is unaffected either
   way. Off by default; see above for what it buys.
-- **Per-user backend identity has to be configured.** `backend_users`
-  needs a DSN per role, so users resolved dynamically through
-  `auth_query` still share the `backend_dsn` identity. SCRAM
-  pass-through — reusing the client's own proof to authenticate to
-  Postgres, as PgBouncer does — would remove that requirement but needs
-  a backend connector of our own instead of `pgconn`.
+- **SCRAM pass-through pools are never evicted.** One per role that has
+  connected since startup, each with its own reaper goroutine. Bounded
+  by your role count, since only a completed SCRAM handshake creates
+  one, but a process that has seen every role keeps every pool.
+- **SCRAM pass-through dials through its own connector,** not `pgconn`,
+  because `pgconn` offers no way to sign with a recovered `ClientKey`.
+  It reuses `pgconn.ParseConfig` for TLS, but the handshake is ours and
+  has far less mileage on it than `pgconn`'s.
 - **`SIGHUP` does not resize or re-target existing pools** — only adds
   and removes them. Changing a limit, DSN or TLS setting needs a restart.
 - **No online restart (`-R`).** This is deliberate; see `DEV_PLAN.md`

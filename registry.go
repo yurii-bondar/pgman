@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
@@ -37,9 +38,13 @@ type registryEntry struct {
 	backendUser string
 	// config has BackendDSN already resolved to this entry's identity,
 	// so newPool needs to know nothing about the split.
-	config  PoolConfig
-	pool    *pool.Pool
-	dnsStop func() // no-op if DNS watching is disabled
+	config PoolConfig
+	// passthrough marks an entry that dials with a ClientKey recovered
+	// from the client's own handshake rather than with the DSN's
+	// credentials.
+	passthrough bool
+	pool        *pool.Pool
+	dnsStop     func() // no-op if DNS watching is disabled
 }
 
 // PoolRegistry is the live, mutable set of pools. Sessions capture
@@ -62,6 +67,11 @@ type PoolRegistry struct {
 	eventLog       *EventLog
 	defaults       *Config // top-level defaults for per-pool lifecycle merge; may be nil for tests
 	observeAcquire func(poolName string) pool.ObserveWaitFunc
+
+	// keys is the SCRAM pass-through credential store, consulted to
+	// decide whether a user can have a pool of its own. Nil when no
+	// pool asks for pass-through.
+	keys *clientKeyStore
 
 	mu      sync.RWMutex
 	entries map[string]*registryEntry
@@ -104,52 +114,130 @@ func (r *PoolRegistry) addEntries(name string, cfg PoolConfig) {
 		r.byDatabase[alias] = name
 	}
 
-	r.entries[poolKey(name, "")] = r.newEntry(name, "", cfg)
+	r.entries[poolKey(name, "")] = r.newEntry(name, "", cfg, false)
 	for user, dsn := range cfg.BackendUsers {
 		// Same pool in every respect except who it connects as.
 		userCfg := cfg
 		userCfg.BackendDSN = dsn
-		r.entries[poolKey(name, user)] = r.newEntry(name, user, userCfg)
+		r.entries[poolKey(name, user)] = r.newEntry(name, user, userCfg, false)
 	}
+	// Pass-through pools cannot be built here: the credential does not
+	// exist until a client authenticates. They appear on first use, in
+	// Resolve.
 }
 
-func (r *PoolRegistry) newEntry(name, backendUser string, cfg PoolConfig) *registryEntry {
+func (r *PoolRegistry) newEntry(name, backendUser string, cfg PoolConfig, passthrough bool) *registryEntry {
 	key := poolKey(name, backendUser)
-	p := r.newPool(key, cfg)
+	p := r.newPool(key, cfg, r.dialerFor(cfg, backendUser, passthrough))
 	return &registryEntry{
 		poolName:    name,
 		backendUser: backendUser,
 		config:      cfg,
+		passthrough: passthrough,
 		pool:        p,
 		dnsStop:     r.startDNSWatcherFor(key, cfg, p),
 	}
 }
 
+// dialerFor picks how an entry opens backend connections: with the
+// DSN's own credentials, or as backendUser via SCRAM pass-through.
+func (r *PoolRegistry) dialerFor(cfg PoolConfig, backendUser string, passthrough bool) pool.Dialer {
+	requireTLS := r.defaults != nil && r.defaults.RequireBackendTLS
+	if passthrough {
+		return newPassthroughDialer(cfg.BackendDSN, backendUser, r.keys, requireTLS)
+	}
+	return newDialBackend(cfg.BackendDSN, cfg.BackendAddr, requireTLS)
+}
+
+// SetClientKeyStore wires the pass-through credential store. Called at
+// startup, before any listener accepts, so no Resolve can race it.
+func (r *PoolRegistry) SetClientKeyStore(store *clientKeyStore) {
+	r.keys = store
+}
+
 // Resolve maps a client's (database, user) onto the pool that will
-// carry its queries, following aliases and honouring backend_users.
-// The returned key is the registry key — also the metric label and the
-// name every admin surface shows.
+// carry its queries, following aliases and honouring backend_users and
+// scram_passthrough. The returned key is the registry key — also the
+// metric label and the name every admin surface shows.
 func (r *PoolRegistry) Resolve(database, user string) (key string, p *pool.Pool, cfg PoolConfig, ok bool) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	name, found := r.byDatabase[database]
 	if !found {
+		r.mu.RUnlock()
 		return "", nil, PoolConfig{}, false
 	}
-	// A user with its own backend credentials gets its own pool; anyone
-	// else shares the one dialed with the pool's BackendDSN.
-	backendUser := ""
-	if base, exists := r.entries[poolKey(name, "")]; exists {
-		if _, has := base.config.BackendUsers[user]; has {
-			backendUser = user
-		}
+	base, hasBase := r.entries[poolKey(name, "")]
+	if !hasBase {
+		r.mu.RUnlock()
+		return "", nil, PoolConfig{}, false
 	}
+	backendUser, passthrough := r.backendIdentityFor(base.config, user)
 	e, exists := r.entries[poolKey(name, backendUser)]
-	if !exists {
+	baseCfg := base.config
+	r.mu.RUnlock()
+
+	if exists {
+		return poolKey(name, backendUser), e.pool, e.config, true
+	}
+	// The only way to miss is a pass-through user seen for the first
+	// time: its credential did not exist until it logged in, so its pool
+	// could not have been built at startup.
+	if !passthrough {
 		return "", nil, PoolConfig{}, false
 	}
-	return poolKey(name, backendUser), e.pool, e.config, true
+	return r.createPassthroughEntry(name, user, baseCfg)
+}
+
+// backendIdentityFor decides which backend role a client reaches
+// Postgres as, and whether that role's credentials come from a
+// pass-through ClientKey. An empty user means the pool's own BackendDSN
+// identity.
+//
+// backend_users wins over scram_passthrough: an explicitly configured
+// DSN is the operator saying exactly how this user should connect, and
+// a recovered ClientKey should not quietly override it.
+func (r *PoolRegistry) backendIdentityFor(cfg PoolConfig, user string) (backendUser string, passthrough bool) {
+	if user == "" {
+		return "", false
+	}
+	if _, configured := cfg.BackendUsers[user]; configured {
+		return user, false
+	}
+	// No ClientKey means the client authenticated by some other method
+	// — trust, peer, cert — and there is nothing to pass through.
+	if cfg.ScramPassthrough && r.keys.has(user) {
+		return user, true
+	}
+	return "", false
+}
+
+// createPassthroughEntry builds a per-user pass-through pool on first
+// use. Pools are never evicted afterwards, which is bounded because
+// only a client that completed a SCRAM handshake can cause one: the set
+// of pools is the set of real roles that have connected, not anything a
+// caller can inflate.
+func (r *PoolRegistry) createPassthroughEntry(name, user string, cfg PoolConfig) (string, *pool.Pool, PoolConfig, bool) {
+	key := poolKey(name, user)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Another session for the same user may have won the race between
+	// dropping the read lock and taking this one.
+	if e, exists := r.entries[key]; exists {
+		return key, e.pool, e.config, true
+	}
+	// Re-check the pool still exists: a Remove could have landed in the
+	// same window, and resurrecting it here would route clients into a
+	// database the operator has taken out.
+	if _, stillThere := r.entries[poolKey(name, "")]; !stillThere {
+		return "", nil, PoolConfig{}, false
+	}
+
+	e := r.newEntry(name, user, cfg, true)
+	r.entries[key] = e
+	slog.Info("pool: opened a SCRAM pass-through pool",
+		"pool", key, "user", user, "limit", cfg.Limit)
+	return key, e.pool, e.config, true
 }
 
 // startDNSWatcherFor centralizes the "should this pool have a DNS
@@ -165,7 +253,7 @@ func (r *PoolRegistry) startDNSWatcherFor(name string, cfg PoolConfig, p *pool.P
 // newPool centralizes pool.New so lifecycle options (idle timeout,
 // lifetime, min idle, healthcheck delay, dial retry, wait observer) are
 // resolved from the merged config in exactly one place.
-func (r *PoolRegistry) newPool(name string, cfg PoolConfig) *pool.Pool {
+func (r *PoolRegistry) newPool(name string, cfg PoolConfig, dial pool.Dialer) *pool.Pool {
 	opts := []pool.Option{}
 	// healthCheckTimeout is resolved here rather than baked into the
 	// healthCheck function, which is why this used to silently ignore
@@ -202,12 +290,8 @@ func (r *PoolRegistry) newPool(name string, cfg PoolConfig) *pool.Pool {
 			opts = append(opts, pool.WithObserveWait(fn))
 		}
 	}
-	requireTLS := false
-	if r.defaults != nil {
-		requireTLS = r.defaults.RequireBackendTLS
-	}
 	check := func(conn net.Conn) error { return healthCheckWithTimeout(conn, healthCheckTimeout) }
-	return pool.New(newDialBackend(cfg.BackendDSN, cfg.BackendAddr, requireTLS), cfg.Limit, check, r.onEvent(name), opts...)
+	return pool.New(dial, cfg.Limit, check, r.onEvent(name), opts...)
 }
 
 // onEvent returns a pool.EventFunc bound to name, for tagging each event

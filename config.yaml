@@ -183,6 +183,24 @@ pools:
     # certificate auth with no password at all.
     # backend_users:
     #   alice: "postgres://alice@localhost:5432/backoffice?sslmode=verify-full&passfile=/etc/pgman/pgpass"
+
+    # Or let every client bring its own credential. With scram_passthrough
+    # the ClientKey recovered from a client's SCRAM handshake with pgman is
+    # reused to authenticate to Postgres as that same role — nothing to
+    # configure per user, nothing on disk, and users resolved through
+    # auth_query are covered too.
+    #
+    # Requires pgman's verifier for a user to be the backend's verifier,
+    # because ClientKey derives from its salt and iteration count. Copying
+    # rolpassword into auth_users (as above) or pointing auth_query at this
+    # backend's pg_shadow makes that automatic; anything else fails with a
+    # message saying so.
+    #
+    # The cost: pgman then keeps a password-equivalent in memory for every
+    # user that has logged in, instead of only verifiers. Clients using
+    # trust, peer or cert auth have no ClientKey and keep sharing the
+    # backend_dsn role.
+    # scram_passthrough: true
     # idle_timeout, max_lifetime, etc. inherit top-level defaults unless set here
 
   game_rgs:

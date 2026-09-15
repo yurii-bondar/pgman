@@ -229,9 +229,21 @@ func main() {
 	promRegistry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := newProxyMetrics(promRegistry)
 
+	// The pass-through store exists only when a pool asks for it, so a
+	// deployment that does not use the feature never derives, and never
+	// holds, any authentication material.
+	var keyStore *clientKeyStore
+	for _, pc := range cfg.Pools {
+		if pc.ScramPassthrough {
+			keyStore = newClientKeyStore()
+			break
+		}
+	}
+
 	poolRegistry := NewPoolRegistryWithDefaults(cfg.Pools, eventLog, cfg, func(name string) pool.ObserveWaitFunc {
 		return metrics.observeAcquire(name)
 	})
+	poolRegistry.SetClientKeyStore(keyStore)
 	promRegistry.MustRegister(newPoolsCollector(poolRegistry))
 	// pgbouncer_exporter-compatible aliases: same underlying stats,
 	// PgBouncer-named metrics so Grafana dashboards work unchanged.
@@ -390,6 +402,11 @@ func main() {
 			slog.Info("auth_query enabled",
 				"dsn_host_hint", firstToken(cfg.AuthQueryDSN, "@"),
 				"cache_ttl", cfg.AuthQueryCacheTTL)
+		}
+		scramAuth.SetClientKeyStore(keyStore)
+		if keyStore != nil {
+			slog.Info("scram pass-through enabled — backend connections are opened as the authenticated client",
+				"note", "pgman holds a password-equivalent in memory for every user that logs in")
 		}
 		authBackend = scramAuth
 	} else {

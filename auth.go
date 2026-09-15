@@ -65,6 +65,12 @@ type SCRAMAuth struct {
 	// specific and shouldn't leak into the auth path.
 	dynamicLookup func(user string) (scram.StoredCredentials, error)
 
+	// keyStore, when set, receives the ClientKey recovered from every
+	// successful exchange, for SCRAM pass-through to authenticate to
+	// Postgres as this same user. Nil when pass-through is disabled,
+	// and then nothing is ever recovered or retained.
+	keyStore *clientKeyStore
+
 	// serverEndpointBinding is precomputed once at startup from the
 	// proxy's own TLS certificate — tls-server-end-point (RFC 5929) hashes
 	// the *server's* certificate, and that's the same certificate on every
@@ -72,6 +78,13 @@ type SCRAMAuth struct {
 	// when TLS isn't configured, in which case SCRAM-SHA-256-PLUS is
 	// simply never offered.
 	serverEndpointBinding *scram.ChannelBinding
+}
+
+// SetClientKeyStore enables SCRAM pass-through capture. Call it only
+// when at least one pool asks for pass-through: without a store no
+// authentication material is ever derived, let alone kept.
+func (a *SCRAMAuth) SetClientKeyStore(store *clientKeyStore) {
+	a.keyStore = store
 }
 
 // SetDynamicLookup wires an auth_query-style resolver used when a user
@@ -185,6 +198,10 @@ func (a *SCRAMAuth) Authenticate(pg *pgproto3.Backend, conn net.Conn, startup *p
 	if !ok {
 		return fmt.Errorf("expected SASLInitialResponse, got %T", msg)
 	}
+	// Copied now, not later: pgproto3 decodes into a reused buffer, so
+	// initial.Data is overwritten by the next Receive. Pass-through
+	// needs this message verbatim once the exchange has completed.
+	clientFirst := string(initial.Data)
 
 	server, err := scram.SHA256.NewServer(func(string) (scram.StoredCredentials, error) {
 		// Real Postgres ignores the username embedded in the SCRAM message
@@ -231,6 +248,7 @@ func (a *SCRAMAuth) Authenticate(pg *pgproto3.Backend, conn net.Conn, startup *p
 	if !ok {
 		return fmt.Errorf("expected SASLResponse, got %T", msg)
 	}
+	clientFinal := string(final.Data)
 
 	serverFinal, err := conv.Step(string(final.Data))
 	if err != nil {
@@ -243,8 +261,39 @@ func (a *SCRAMAuth) Authenticate(pg *pgproto3.Backend, conn net.Conn, startup *p
 		return fmt.Errorf("scram conversation did not validate")
 	}
 
+	// The client has proved itself, which means its proof carries a
+	// recoverable ClientKey — the credential pass-through needs to open
+	// backend connections as this user. Captured here rather than
+	// reconstructed later because these three messages are gone the
+	// moment this function returns.
+	a.captureClientKey(user, creds, scramExchange{
+		ClientFirst: clientFirst,
+		ServerFirst: serverFirst,
+		ClientFinal: clientFinal,
+	})
+
 	pg.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte(serverFinal)})
 	return pg.Flush()
+}
+
+// captureClientKey recovers and stores the client's ClientKey. A
+// failure is logged, not returned: the client has authenticated
+// correctly and refusing it over a pooling-identity concern would turn
+// a degraded feature into an outage. The consequence is that this
+// user's queries run under the pool's own backend role instead of their
+// own, which is the behaviour of every pool without pass-through — so
+// the warning has to say enough to notice.
+func (a *SCRAMAuth) captureClientKey(user string, creds scram.StoredCredentials, ex scramExchange) {
+	if a.keyStore == nil {
+		return
+	}
+	clientKey, err := recoverClientKey(ex, creds.StoredKey)
+	if err != nil {
+		slog.Warn("scram: could not recover the client key, this user falls back to the pool's own backend role",
+			"user", user, "err", err)
+		return
+	}
+	a.keyStore.remember(user, clientKey, creds)
 }
 
 // ParseSCRAMVerifier parses Postgres's own SCRAM verifier format:

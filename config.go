@@ -387,6 +387,24 @@ type PoolConfig struct {
 	// listed user, each up to Limit connections.
 	BackendUsers map[string]string `yaml:"backend_users"`
 
+	// ScramPassthrough opens each client's backend connections under
+	// that client's own role, reusing the ClientKey recovered from its
+	// SCRAM handshake with pgman. No per-user credential is configured
+	// or stored on disk, and users resolved through auth_query are
+	// covered too — which is what backend_users cannot do.
+	//
+	// Requires the verifier pgman holds for a user to be the same one
+	// the backend holds, because ClientKey is derived from its salt and
+	// iteration count. Copy rolpassword into auth_users, or point
+	// auth_query at this backend's pg_shadow, and that is automatic.
+	//
+	// The cost is that pgman keeps a password-equivalent in memory for
+	// every user that has logged in, where otherwise it keeps only
+	// verifiers. See clientKeyStore. Clients that authenticate by some
+	// other method — trust, peer, cert — have no ClientKey to reuse and
+	// keep sharing the BackendDSN role.
+	ScramPassthrough bool `yaml:"scram_passthrough"`
+
 	// Aliases are extra client-visible database names that route to
 	// this pool. The primary building block for r/w split (an "app_ro"
 	// alias on a replica pool sends read-only clients to replicas
