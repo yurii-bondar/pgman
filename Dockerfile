@@ -5,7 +5,7 @@
 # multi-arch build that is the difference between a Go toolchain running
 # at native speed and one emulated instruction by instruction — minutes
 # per architecture, for a binary that needs no emulation to produce.
-FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 
