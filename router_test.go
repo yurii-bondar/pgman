@@ -8,12 +8,12 @@ import (
 
 func TestDatabaseRouterRoutesToConfiguredPool(t *testing.T) {
 	registry := NewPoolRegistry(map[string]PoolConfig{
-		"backoffice": dummyPoolConfig(2),
+		"shop": dummyPoolConfig(2),
 	}, NewEventLog(10))
 	router := NewDatabaseRouter(registry)
 
-	want, _ := registry.Get("backoffice")
-	got, err := router.Route(&pgproto3.StartupMessage{Parameters: map[string]string{"database": "backoffice", "user": "rgs"}})
+	want, _ := registry.Get("shop")
+	got, err := router.Route(&pgproto3.StartupMessage{Parameters: map[string]string{"database": "shop", "user": "rgs"}})
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestDatabaseRouterReturnsSessionModeWhenConfigured(t *testing.T) {
 }
 
 func TestDatabaseRouterRejectsUnknownDatabase(t *testing.T) {
-	registry := NewPoolRegistry(map[string]PoolConfig{"backoffice": dummyPoolConfig(2)}, NewEventLog(10))
+	registry := NewPoolRegistry(map[string]PoolConfig{"shop": dummyPoolConfig(2)}, NewEventLog(10))
 	router := NewDatabaseRouter(registry)
 
 	_, err := router.Route(&pgproto3.StartupMessage{Parameters: map[string]string{"database": "nope", "user": "rgs"}})

@@ -32,7 +32,7 @@ func TestPoolRows(t *testing.T) {
 }
 
 func TestSessionRowsReflectsRegisteredSessions(t *testing.T) {
-	pid, sess := registerSession("frank", "backoffice")
+	pid, sess := registerSession("frank", "shop")
 	defer deregisterSession(pid)
 
 	rows := sessionRows()
@@ -40,8 +40,8 @@ func TestSessionRowsReflectsRegisteredSessions(t *testing.T) {
 	for _, r := range rows {
 		if r.PID == pid {
 			found = &struct{}{}
-			if r.User != "frank" || r.Database != "backoffice" {
-				t.Errorf("got user=%s db=%s, want frank/backoffice", r.User, r.Database)
+			if r.User != "frank" || r.Database != "shop" {
+				t.Errorf("got user=%s db=%s, want frank/shop", r.User, r.Database)
 			}
 			if r.Active {
 				t.Error("expected idle session to show Active=false")

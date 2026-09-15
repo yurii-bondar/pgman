@@ -35,12 +35,12 @@ func renderString(t *testing.T, render func(w *strings.Builder) error) string {
 
 func TestPoolsTableRendersRows(t *testing.T) {
 	rows := []PoolRow{
-		{Name: "backoffice", Limit: 2, InUse: 2, Idle: 0, AcquireTotal: 5, AcquireSeconds: 1.234, Discards: 1, DialErrors: 0},
+		{Name: "shop", Limit: 2, InUse: 2, Idle: 0, AcquireTotal: 5, AcquireSeconds: 1.234, Discards: 1, DialErrors: 0},
 	}
 	out := renderString(t, func(w *strings.Builder) error {
 		return PoolsTable(rows).Render(context.Background(), w)
 	})
-	for _, want := range []string{"backoffice", "2 / 2", "full", "1.234"} {
+	for _, want := range []string{"shop", "2 / 2", "full", "1.234"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected output to contain %q, got:\n%s", want, out)
 		}
@@ -96,12 +96,12 @@ func TestSessionsTableEmpty(t *testing.T) {
 
 func TestRecentEventsRendersRows(t *testing.T) {
 	rows := []EventRow{
-		{Time: "12:00:00", Pool: "backoffice", Kind: "discard", Err: ""},
+		{Time: "12:00:00", Pool: "shop", Kind: "discard", Err: ""},
 	}
 	out := renderString(t, func(w *strings.Builder) error {
 		return RecentEvents(rows).Render(context.Background(), w)
 	})
-	for _, want := range []string{"12:00:00", "backoffice", "discard"} {
+	for _, want := range []string{"12:00:00", "shop", "discard"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected output to contain %q, got:\n%s", want, out)
 		}
@@ -118,11 +118,11 @@ func TestRecentEventsEmpty(t *testing.T) {
 }
 
 func TestManagePanelRendersControlsAndMessage(t *testing.T) {
-	rows := []ManageRow{{Name: "backoffice", Limit: 3}}
+	rows := []ManageRow{{Name: "shop", Limit: 3}}
 	out := renderString(t, func(w *strings.Builder) error {
 		return ManagePanel(rows, "pool added", false).Render(context.Background(), w)
 	})
-	for _, want := range []string{"backoffice", "/pools/backoffice/resize", "/pools/backoffice/remove", "pool added"} {
+	for _, want := range []string{"shop", "/pools/shop/resize", "/pools/shop/remove", "pool added"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected output to contain %q, got:\n%s", want, out)
 		}
@@ -186,13 +186,13 @@ func TestPageRendersFourTabsWithStatusDefaultVisible(t *testing.T) {
 func TestPageRendersAllSections(t *testing.T) {
 	out := renderString(t, func(w *strings.Builder) error {
 		return Page(
-			[]PoolRow{{Name: "backoffice", Limit: 2}},
+			[]PoolRow{{Name: "shop", Limit: 2}},
 			[]SessionRow{{PID: 1, User: "u", Database: "d"}},
 			[]EventRow{{Time: "t", Pool: "p", Kind: "k"}},
-			[]ManageRow{{Name: "backoffice", Limit: 2}},
+			[]ManageRow{{Name: "shop", Limit: 2}},
 		).Render(context.Background(), w)
 	})
-	for _, want := range []string{"<!doctype html", "pgman", "backoffice", "sse-connect=\"/events\"", `id="pools"`, `id="sessions"`, `id="events"`, `id="manage-panel"`} {
+	for _, want := range []string{"<!doctype html", "pgman", "shop", "sse-connect=\"/events\"", `id="pools"`, `id="sessions"`, `id="events"`, `id="manage-panel"`} {
 		if !strings.Contains(strings.ToLower(out), strings.ToLower(want)) {
 			t.Errorf("expected page to contain %q", want)
 		}

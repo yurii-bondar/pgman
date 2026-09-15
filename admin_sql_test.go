@@ -102,8 +102,8 @@ func countDataRows(msgs []pgproto3.BackendMessage) int {
 func adminTestRegistry(t *testing.T) *PoolRegistry {
 	t.Helper()
 	return NewPoolRegistry(map[string]PoolConfig{
-		"backoffice": dummyPoolConfig(4),
-		"game_rgs":   dummyPoolConfig(7),
+		"shop":      dummyPoolConfig(4),
+		"analytics": dummyPoolConfig(7),
 	}, NewEventLog(10))
 }
 
@@ -116,7 +116,7 @@ func TestAdminQueryAlwaysEndsWithReadyForQuery(t *testing.T) {
 		"SHOW POOLS", "SHOW STATS", "SHOW CLIENTS", "SHOW SERVERS",
 		"SHOW DATABASES", "SHOW LISTS", "SHOW VERSION",
 		"PAUSE", "RESUME", "RECONNECT",
-		"PAUSE backoffice", "RESUME backoffice",
+		"PAUSE shop", "RESUME shop",
 		"DROP TABLE users", // unsupported — still must terminate cleanly
 		"",
 	}
@@ -200,10 +200,10 @@ func TestShowPoolsReturnsRowPerPool(t *testing.T) {
 // instead would be an outage.
 func TestPauseResumeAffectTheNamedPoolOnly(t *testing.T) {
 	registry := adminTestRegistry(t)
-	target, _ := registry.Get("backoffice")
-	other, _ := registry.Get("game_rgs")
+	target, _ := registry.Get("shop")
+	other, _ := registry.Get("analytics")
 
-	adminExchange(t, registry, "PAUSE backoffice")
+	adminExchange(t, registry, "PAUSE shop")
 	if !target.IsPaused() {
 		t.Error("the named pool was not paused")
 	}
@@ -211,7 +211,7 @@ func TestPauseResumeAffectTheNamedPoolOnly(t *testing.T) {
 		t.Error("PAUSE with an argument must not touch other pools")
 	}
 
-	adminExchange(t, registry, "RESUME backoffice")
+	adminExchange(t, registry, "RESUME shop")
 	if target.IsPaused() {
 		t.Error("RESUME did not un-pause the named pool")
 	}

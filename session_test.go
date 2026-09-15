@@ -11,11 +11,11 @@ import (
 )
 
 func TestRegisterDeregisterSessionLifecycle(t *testing.T) {
-	pid, sess := registerSession("alice", "backoffice")
+	pid, sess := registerSession("alice", "shop")
 	defer deregisterSession(pid)
 
-	if sess.user != "alice" || sess.database != "backoffice" {
-		t.Errorf("got user=%s database=%s, want alice/backoffice", sess.user, sess.database)
+	if sess.user != "alice" || sess.database != "shop" {
+		t.Errorf("got user=%s database=%s, want alice/shop", sess.user, sess.database)
 	}
 	if len(sess.secret) == 0 || bytes.Equal(sess.secret, make([]byte, len(sess.secret))) {
 		t.Error("secret must not be empty or all-zero (crypto/rand should never produce that reliably, but defend against a broken generator)")
@@ -46,7 +46,7 @@ func TestRegisterSessionPIDsAreUnique(t *testing.T) {
 }
 
 func TestListSessionsReflectsActiveState(t *testing.T) {
-	pid, sess := registerSession("bob", "game_rgs")
+	pid, sess := registerSession("bob", "analytics")
 	defer deregisterSession(pid)
 
 	find := func() (SessionInfo, bool) {
@@ -65,8 +65,8 @@ func TestListSessionsReflectsActiveState(t *testing.T) {
 	if info.Active {
 		t.Error("a freshly registered session must start idle")
 	}
-	if info.User != "bob" || info.Database != "game_rgs" {
-		t.Errorf("got user=%s database=%s, want bob/game_rgs", info.User, info.Database)
+	if info.User != "bob" || info.Database != "analytics" {
+		t.Errorf("got user=%s database=%s, want bob/analytics", info.User, info.Database)
 	}
 
 	sess.setBackend(&backendConn{})

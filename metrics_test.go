@@ -31,8 +31,8 @@ func TestPoolsCollectorDescribeCount(t *testing.T) {
 
 func TestPoolsCollectorCollectPerPool(t *testing.T) {
 	registry := NewPoolRegistry(map[string]PoolConfig{
-		"backoffice": dummyPoolConfig(2),
-		"game_rgs":   dummyPoolConfig(3),
+		"shop":      dummyPoolConfig(2),
+		"analytics": dummyPoolConfig(3),
 	}, NewEventLog(10))
 	c := newPoolsCollector(registry)
 
@@ -71,8 +71,8 @@ func TestPoolsCollectorCollectPerPool(t *testing.T) {
 	if len(seen) != 2 {
 		t.Fatalf("expected metrics for 2 pools, got %d: %v", len(seen), seen)
 	}
-	if len(seen["backoffice"]) != poolCollectorMetricCount {
-		t.Errorf("expected %d metrics for backoffice, got %d", poolCollectorMetricCount, len(seen["backoffice"]))
+	if len(seen["shop"]) != poolCollectorMetricCount {
+		t.Errorf("expected %d metrics for shop, got %d", poolCollectorMetricCount, len(seen["shop"]))
 	}
 }
 

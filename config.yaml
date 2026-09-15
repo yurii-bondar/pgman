@@ -122,18 +122,18 @@ log_level: "info"                           # debug/info/warn/error
 require_backend_tls: true
 
 pools:
-  backoffice:
+  shop:
     # Never commit a real password here. Keep this file free of secrets
     # and inject the DSN from your secret store / environment at deploy
     # time; the placeholders below exist to be replaced.
-    backend_dsn: "postgres://REPLACE_USER:REPLACE_PASSWORD@localhost:5432/backoffice?sslmode=verify-full"
+    backend_dsn: "postgres://REPLACE_USER:REPLACE_PASSWORD@localhost:5432/shop?sslmode=verify-full"
     backend_addr: "localhost:5432"
     limit: 20
     min_idle: 2                             # keep 2 conns warm at all times
     # idle_timeout, max_lifetime, etc. inherit top-level defaults unless set here
 
-  game_rgs:
-    backend_dsn: "postgres://REPLACE_USER:REPLACE_PASSWORD@localhost:5433/game_rgs?sslmode=verify-full"
+  analytics:
+    backend_dsn: "postgres://REPLACE_USER:REPLACE_PASSWORD@localhost:5433/analytics?sslmode=verify-full"
     backend_addr: "localhost:5433"
     limit: 20
     min_idle: 2

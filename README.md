@@ -46,7 +46,7 @@ go build -o pgman .
 Then point any Postgres client at the proxy:
 
 ```sh
-psql "postgres://rgs@127.0.0.1:6435/backoffice"
+psql "postgres://rgs@127.0.0.1:6435/shop"
 ```
 
 The whole stack, proxy included, also runs from Compose:
