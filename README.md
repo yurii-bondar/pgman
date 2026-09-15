@@ -90,7 +90,7 @@ exists. The settings worth knowing up front:
 | `circuit_breaker_cooldown` | How long the breaker stays open. | `5s` |
 | `require_backend_tls` | Refuse pools whose DSN does not mandate TLS. | `false` |
 | `server_reset_query` | Scrub run before a backend is handed to a different session. | `DISCARD ALL` |
-| `server_reset_query_always` | Scrub on every acquire, including same-session reuse. | `false` |
+| `server_reset_query_skip_same_session` | Skip the scrub when the same session reacquires the connection. | `false` |
 | `server_lifetime` | Max age of a backend connection, from dial. | unset |
 | `server_idle_timeout` | Max idle time before a backend is closed. | unset |
 | `shutdown_timeout` | Drain budget on `SIGTERM`. | `30s` |
@@ -158,6 +158,31 @@ admin_users:
   - ops
 ```
 
+### `server_reset_query_skip_same_session`
+
+`server_reset_query` scrubs a backend when it passes from one session to
+another. Between two transactions of the *same* session it isolates that
+session from itself, and the tracked-parameter replay then restores what
+it wiped — two round trips per transaction. Setting
+`server_reset_query_skip_same_session: true` skips both when the pool
+returns a connection to the session that just released it.
+
+The skip only fires when a session gets its own connection back, so the
+win shrinks as clients oversubscribe the pool. Measured on a laptop
+against a Docker Postgres, `TestPgbenchStyleMix`, 15s runs, pool of 50,
+mean of 3 runs (6 at 100 clients):
+
+| Clients | Off | On | Change |
+| --- | --- | --- | --- |
+| 1 | 1803 QPS | 3101 QPS | +72% |
+| 4 | 5413 QPS | 6386 QPS | +18% |
+| 20 | 15152 QPS | 17205 QPS | +14% |
+| 100 | 20633 QPS | 21080 QPS | none — run-to-run spread swamps it |
+
+At 100 clients over 50 backends a released connection is taken by a
+waiter before its owner can reacquire it, so the skip rarely fires and
+the workload is backend-bound anyway.
+
 ### Admin UI
 
 `admin_addr` serves a read-mostly dashboard (pool sizes, in-use, idle,
@@ -214,14 +239,13 @@ Honest list, so nobody discovers these in an incident:
   working, but a Bind for an evicted name can reach a backend that never
   saw the Parse and get `26000` back; drivers with their own statement
   cache re-Parse through that.
-- **Session state can survive a transaction when the pool hands back the
-  same connection.** `server_reset_query` runs on handover to a
-  different session, not on every release, so a session-level `SET` in
-  transaction pooling is lost sometimes and not others — an app can
-  appear to get away with it until load starts moving connections
-  between clients. Isolation between different clients is unaffected.
-  Set `server_reset_query_always: true` to trade two round trips per
-  transaction for the deterministic behaviour.
+- **`server_reset_query_skip_same_session` trades determinism for two
+  round trips per transaction.** With it on, a session-level `SET` in
+  transaction pooling survives whenever the pool hands back the same
+  connection and is lost when it doesn't, so an app can appear to get
+  away with session state until load starts moving connections between
+  clients. Isolation between different clients is unaffected either
+  way. Off by default; see above for what it buys.
 - **`SIGHUP` does not resize or re-target existing pools** — only adds
   and removes them. Changing a limit, DSN or TLS setting needs a restart.
 - **No online restart (`-R`).** This is deliberate; see `DEV_PLAN.md`

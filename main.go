@@ -48,9 +48,10 @@ type runtimeOpts struct {
 	clientIdleTimeout      time.Duration
 	idleTransactionTimeout time.Duration
 	serverResetQuery       string
-	// resetQueryAlways forces the scrub even when the same session
-	// reacquires the connection. See Config.ServerResetQueryAlways.
-	resetQueryAlways bool
+	// resetSkipSameSession skips the scrub when the same session
+	// reacquires the connection. See
+	// Config.ServerResetQuerySkipSameSession.
+	resetSkipSameSession bool
 
 	// clientSlots is the max_client_conn semaphore: one buffered slot
 	// per admissible client connection, nil meaning unlimited.
@@ -136,13 +137,13 @@ func runtimeOptsFromConfig(cfg *Config, metrics *proxyMetrics) *runtimeOpts {
 		clientIdleTimeout:      cfg.ClientIdleTimeout,
 		idleTransactionTimeout: cfg.IdleTransactionTimeout,
 
-		serverResetQuery: cfg.ServerResetQuery,
-		resetQueryAlways: cfg.ServerResetQueryAlways,
-		maxPreparedStmts: cfg.MaxPreparedStatements,
-		metrics:          metrics,
-		adminDatabase:    cfg.AdminDatabase,
-		adminUsers:       adminUserSet(cfg.AdminUsers),
-		trackExtraParams: cfg.TrackExtraParameters,
+		serverResetQuery:     cfg.ServerResetQuery,
+		resetSkipSameSession: cfg.ServerResetQuerySkipSameSession,
+		maxPreparedStmts:     cfg.MaxPreparedStatements,
+		metrics:              metrics,
+		adminDatabase:        cfg.AdminDatabase,
+		adminUsers:           adminUserSet(cfg.AdminUsers),
+		trackExtraParams:     cfg.TrackExtraParameters,
 		// adminSession is wired up by main() where the registry is
 		// available. Left nil here so plain runtimeOptsFromConfig
 		// callers (tests) don't accidentally enable admin SQL without
@@ -1611,7 +1612,7 @@ func adoptBackend(fe *pgproto3.Frontend, backend *backendConn, sess *session, op
 	if sess.id == 0 {
 		sess.id = nextSessionID.Add(1)
 	}
-	if backend.stateOwner == sess.id && !opts.resetQueryAlways {
+	if opts.resetSkipSameSession && backend.stateOwner == sess.id {
 		return nil // our own state, already in place: nothing to do
 	}
 

@@ -74,17 +74,26 @@ client_login_timeout: "60s"                 # startup+auth deadline; defends aga
 query_wait_timeout: "120s"                  # max Acquire wait on saturated pool
 server_reset_query: "DISCARD ALL"           # session-state scrub between clients
 
-# The scrub runs when a connection passes from one session to another, not
-# on every release: between two transactions of the SAME session it isolates
-# that session from itself, at the cost of two round trips (the DISCARD plus
-# the tracked-parameter replay that restores what it wiped). Isolation
-# between different clients is identical either way.
+# Skip the scrub when the pool hands a connection straight back to the
+# session that just released it. Saves two round trips per transaction (the
+# DISCARD, plus the tracked-parameter replay that restores what it wiped),
+# and with a LIFO pool a serial client hits this case almost every time.
 #
-# Turn this on for determinism rather than safety: with it off, a session
-# level SET survives into the next transaction whenever the pool hands back
-# the same connection, so an app can appear to get away with session state
-# in transaction pooling until load starts moving connections around.
-server_reset_query_always: false
+# Off by default, and the cost is determinism rather than isolation — a
+# different client never sees another's state either way. With it on, a
+# session-level SET survives into the next transaction whenever the pool
+# returns the same connection and is lost when it doesn't, so an app can
+# appear to get away with session state until load starts moving
+# connections between clients. Turn it on when your clients treat each
+# transaction as independent, which transaction pooling asks of them anyway.
+#
+# Where it pays: the skip only fires when a session gets its own connection
+# back, so the win shrinks as clients oversubscribe the pool. Measured on a
+# laptop against a Docker Postgres (15s runs, pool=50): +72% QPS with one
+# serial client, +18% at 4 clients, +13% at 20, and nothing measurable at
+# 100 — there a released connection is taken by a waiter before its owner
+# can reacquire it.
+server_reset_query_skip_same_session: false
 
 # Cap on named prepared statements tracked per client session. Every entry
 # holds the statement's full SQL text, and the client chooses both the names

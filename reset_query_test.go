@@ -160,6 +160,7 @@ func TestResetQuerySkippedWhenSameSessionReusesBackend(t *testing.T) {
 	h := newResetHarness(t)
 	opts := defaultRuntimeOpts()
 	opts.serverResetQuery = "DISCARD ALL"
+	opts.resetSkipSameSession = true
 	opts.healthCheckTimeout = 2 * time.Second
 
 	pid, sess := registerSession("solo", "d")
@@ -186,6 +187,7 @@ func TestTrackedParamsReplayedOnlyOnHandover(t *testing.T) {
 	h := newResetHarness(t)
 	opts := defaultRuntimeOpts()
 	opts.serverResetQuery = "DISCARD ALL"
+	opts.resetSkipSameSession = true
 	opts.healthCheckTimeout = 2 * time.Second
 
 	params := []trackedParam{{Name: "application_name", Value: "billing"}}
@@ -214,14 +216,14 @@ func TestTrackedParamsReplayedOnlyOnHandover(t *testing.T) {
 	}
 }
 
-// TestResetQueryAlwaysDisablesTheSkip covers the escape hatch for
-// operators who would rather have session state reliably discarded than
-// save the two round trips — determinism over latency.
-func TestResetQueryAlwaysDisablesTheSkip(t *testing.T) {
+// TestScrubRunsEveryHandoverByDefault pins the default: the skip is
+// opt-in, so out of the box a session's own state is still discarded
+// between its transactions exactly as it was before the option existed.
+func TestScrubRunsEveryHandoverByDefault(t *testing.T) {
 	h := newResetHarness(t)
 	opts := defaultRuntimeOpts()
 	opts.serverResetQuery = "DISCARD ALL"
-	opts.resetQueryAlways = true
+	opts.resetSkipSameSession = false
 	opts.healthCheckTimeout = 2 * time.Second
 
 	pid, sess := registerSession("solo", "d")
@@ -233,7 +235,7 @@ func TestResetQueryAlwaysDisablesTheSkip(t *testing.T) {
 	// One scrub, not two: the first transaction got a freshly dialed
 	// connection, which has nobody's state to discard.
 	if n := countQueries(h.queries(), "DISCARD ALL"); n != 1 {
-		t.Errorf("server_reset_query_always: expected the reuse to be scrubbed, scrubs = %d", n)
+		t.Errorf("by default the reuse must still be scrubbed, scrubs = %d", n)
 	}
 }
 
