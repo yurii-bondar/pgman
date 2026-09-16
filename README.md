@@ -28,9 +28,8 @@ anywhere that matters, and start with a workload you can move back.
 
 ## Why this exists
 
-PgBouncer is excellent at what it does and pgman does not claim to beat
-it on raw efficiency — C with a single-threaded event loop is hard to
-out-allocate from Go. The bet is on the parts operators complain about:
+PgBouncer is excellent at what it does. The bet here is on the parts
+operators complain about:
 
 - **Observability without a sidecar.** Native Prometheus metrics,
   including an acquire-wait histogram, instead of scraping `SHOW STATS`
@@ -42,6 +41,51 @@ out-allocate from Go. The bet is on the parts operators complain about:
 - **A codebase you can actually change.** Go with narrow interfaces for
   auth backends and routing, so adding one does not mean patching a
   monolithic C core.
+
+### How it actually compares
+
+Measured, not asserted — [`docs/benchmarks.md`](docs/benchmarks.md) has
+the full matrix and [`scripts/bench-vs-pgbouncer.sh`](scripts/bench-vs-pgbouncer.sh)
+reproduces it. Transaction pooling, pool of 50, both poolers scrubbing
+session state, 6 CPUs:
+
+| Clients | PgBouncer 1.25.2 | pgman | |
+| ---: | ---: | ---: | --- |
+| 10 | 16 392 QPS | 17 157 QPS | about equal |
+| 100 | 18 181 QPS | 33 721 QPS | pgman 1.9× |
+| 1000 | 21 666 QPS | 30 798 QPS | pgman 1.4× |
+
+The reason is not clever code, it is cores. PgBouncer is a
+single-threaded event loop and saturates one of them; pgman spreads
+across all of them. Read the corollary carefully, because it is the
+part that decides whether this holds for you:
+
+- **On a busy host the advantage inverts.** The same matrix run while a
+  neighbouring container ate a full core measured pgman at *0.6×*
+  PgBouncer — the Go scheduler had nothing to spread onto, and paid for
+  the attempt. PgBouncer degrades far more gracefully when starved.
+  Give pgman CPU headroom or do not expect these numbers.
+- **Memory is the standing cost.** 15–85 MiB against PgBouncer's
+  3–16 MiB across the same cells, roughly 5×. That is the Go runtime,
+  and it does not go away.
+- **Out of the box the comparison is different again.** PgBouncer skips
+  `server_reset_query` in transaction mode unless
+  `server_reset_query_always` is set, so its default is measurably
+  faster *and* lets a `SET` from one client reach the next. pgman always
+  scrubs. The table above matches them so the numbers compare work
+  against work; if you compare defaults, you are comparing isolation
+  levels rather than speed.
+
+Session pooling past the pool size is the one place the two differ in
+kind rather than degree: PgBouncer closes the excess client
+connections, pgman queues them and fails them with `53300` on
+`query_wait_timeout`. Neither is wrong; they are different contracts.
+
+[`docs/operations.md`](docs/operations.md) covers the operational edges
+these numbers imply: what `DISCARD ALL` actually clears and what turning
+it off gives away, how many client connections are demonstrated (5 000)
+versus assumed, why pgman needs CPU headroom, what an outage looks like
+from `/ready`, and how to go back to PgBouncer if you want to.
 
 ## Quick start
 

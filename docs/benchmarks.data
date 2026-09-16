@@ -1,0 +1,62 @@
+META host=Darwin arm64, 6 CPUs available to Docker
+META pg=PostgreSQL 16.15 on aarch64-unknown-linux-musl
+META pgbouncer=PgBouncer 1.25.2
+META pool_size=50
+META duration=15s
+META warmup=3s
+META reset=matched
+META measured_at=2026-09-16 07:16 UTC
+target=direct mode=none protocol=simple clients=10 conns=10 qps=23643 p50_ms=0.392 p95_ms=0.579 p99_ms=0.989 max_ms=51.539 fails=0 rss_mib=- status=ok
+target=direct mode=none protocol=simple clients=100 conns=100 qps=65669 p50_ms=1.347 p95_ms=2.783 p99_ms=4.698 max_ms=44.540 fails=0 rss_mib=- status=ok
+target=direct mode=none protocol=extended clients=10 conns=10 qps=23259 p50_ms=0.401 p95_ms=0.605 p99_ms=0.982 max_ms=24.302 fails=0 rss_mib=- status=ok
+target=direct mode=none protocol=extended clients=100 conns=100 qps=66584 p50_ms=1.331 p95_ms=2.731 p99_ms=4.591 max_ms=49.262 fails=0 rss_mib=- status=ok
+target=direct mode=none protocol=prepared clients=10 conns=10 qps=24812 p50_ms=0.381 p95_ms=0.553 p99_ms=0.801 max_ms=22.785 fails=0 rss_mib=- status=ok
+target=direct mode=none protocol=prepared clients=100 conns=100 qps=68663 p50_ms=1.269 p95_ms=2.618 p99_ms=4.769 max_ms=38.550 fails=0 rss_mib=- status=ok
+target=pgbouncer mode=transaction protocol=simple clients=10 conns=10 qps=16392 p50_ms=0.570 p95_ms=0.892 p99_ms=1.484 max_ms=16.552 fails=0 rss_mib=3.0 status=ok
+target=pgbouncer mode=transaction protocol=simple clients=100 conns=100 qps=18181 p50_ms=5.725 p95_ms=7.165 p99_ms=9.974 max_ms=57.872 fails=0 rss_mib=4.1 status=ok
+target=pgbouncer mode=transaction protocol=simple clients=1000 conns=1000 qps=21666 p50_ms=47.574 p95_ms=69.328 p99_ms=82.919 max_ms=109.469 fails=0 rss_mib=14.2 status=ok
+target=pgbouncer mode=transaction protocol=extended clients=10 conns=10 qps=17202 p50_ms=0.561 p95_ms=0.819 p99_ms=1.004 max_ms=8.544 fails=0 rss_mib=10.5 status=ok
+target=pgbouncer mode=transaction protocol=extended clients=100 conns=100 qps=18300 p50_ms=5.745 p95_ms=6.840 p99_ms=7.877 max_ms=25.924 fails=0 rss_mib=10.9 status=ok
+target=pgbouncer mode=transaction protocol=extended clients=1000 conns=1000 qps=20309 p50_ms=51.608 p95_ms=70.531 p99_ms=97.890 max_ms=212.750 fails=0 rss_mib=14.0 status=ok
+target=pgbouncer mode=transaction protocol=prepared clients=10 conns=10 qps=14470 p50_ms=0.630 p95_ms=1.036 p99_ms=2.028 max_ms=41.072 fails=0 rss_mib=10.6 status=ok
+target=pgbouncer mode=transaction protocol=prepared clients=100 conns=100 qps=16328 p50_ms=6.369 p95_ms=7.788 p99_ms=9.961 max_ms=54.663 fails=0 rss_mib=11.3 status=ok
+target=pgbouncer mode=transaction protocol=prepared clients=1000 conns=1000 qps=21178 p50_ms=39.556 p95_ms=75.923 p99_ms=98.722 max_ms=379.598 fails=0 rss_mib=16.5 status=ok
+target=pgbouncer mode=session protocol=simple clients=10 conns=10 qps=19355 p50_ms=0.480 p95_ms=0.714 p99_ms=1.332 max_ms=18.140 fails=0 rss_mib=2.9 status=ok
+target=pgbouncer mode=session protocol=simple clients=100 conns=100 qps=33130 p50_ms=1.486 p95_ms=2.062 p99_ms=2.892 max_ms=15.090 fails=719549 rss_mib=3.5 status=ok
+target=pgbouncer mode=session protocol=simple clients=1000 conns=1000 qps=32037 p50_ms=1.443 p95_ms=2.501 p99_ms=4.358 max_ms=41.381 fails=8726768 rss_mib=13.7 status=ok
+target=pgbouncer mode=session protocol=extended clients=10 conns=10 qps=18820 p50_ms=0.486 p95_ms=0.741 p99_ms=1.377 max_ms=26.699 fails=0 rss_mib=10.4 status=ok
+target=pgbouncer mode=session protocol=extended clients=100 conns=100 qps=33338 p50_ms=1.464 p95_ms=2.083 p99_ms=3.080 max_ms=18.680 fails=720481 rss_mib=10.9 status=ok
+target=pgbouncer mode=session protocol=extended clients=1000 conns=1000 qps=29649 p50_ms=1.487 p95_ms=2.969 p99_ms=5.859 max_ms=59.267 fails=8711462 rss_mib=13.3 status=ok
+target=pgbouncer mode=session protocol=prepared clients=10 conns=10 qps=20723 p50_ms=0.464 p95_ms=0.642 p99_ms=0.861 max_ms=11.674 fails=0 rss_mib=10.2 status=ok
+target=pgbouncer mode=session protocol=prepared clients=100 conns=100 qps=30550 p50_ms=1.630 p95_ms=2.171 p99_ms=2.874 max_ms=23.786 fails=719555 rss_mib=10.9 status=ok
+target=pgbouncer mode=session protocol=prepared clients=1000 conns=1000 qps=30546 p50_ms=1.593 p95_ms=2.296 p99_ms=3.708 max_ms=41.494 fails=10016222 rss_mib=13.8 status=ok
+target=pgman mode=transaction protocol=simple clients=10 conns=10 qps=17157 p50_ms=0.556 p95_ms=0.814 p99_ms=1.183 max_ms=19.670 fails=0 rss_mib=15.5 status=ok
+target=pgman mode=transaction protocol=simple clients=100 conns=100 qps=33721 p50_ms=2.399 p95_ms=6.706 p99_ms=9.773 max_ms=41.463 fails=0 rss_mib=22.8 status=ok
+target=pgman mode=transaction protocol=simple clients=1000 conns=1000 qps=30798 p50_ms=29.121 p95_ms=58.002 p99_ms=87.553 max_ms=205.152 fails=0 rss_mib=58.2 status=ok
+target=pgman mode=transaction protocol=extended clients=10 conns=10 qps=15947 p50_ms=0.586 p95_ms=0.906 p99_ms=1.428 max_ms=25.786 fails=0 rss_mib=52.4 status=ok
+target=pgman mode=transaction protocol=extended clients=100 conns=100 qps=30110 p50_ms=2.580 p95_ms=7.855 p99_ms=11.979 max_ms=90.901 fails=0 rss_mib=48.7 status=ok
+target=pgman mode=transaction protocol=extended clients=1000 conns=1000 qps=36180 p50_ms=26.547 p95_ms=40.382 p99_ms=53.897 max_ms=118.894 fails=0 rss_mib=75.6 status=ok
+target=pgman mode=transaction protocol=prepared clients=10 conns=10 qps=15850 p50_ms=0.579 p95_ms=0.949 p99_ms=1.695 max_ms=20.572 fails=0 rss_mib=68.1 status=ok
+target=pgman mode=transaction protocol=prepared clients=100 conns=100 qps=29142 p50_ms=2.598 p95_ms=8.338 p99_ms=13.074 max_ms=175.771 fails=0 rss_mib=46.4 status=ok
+target=pgman mode=transaction protocol=prepared clients=1000 conns=1000 qps=34534 p50_ms=27.164 p95_ms=45.186 p99_ms=61.368 max_ms=146.397 fails=0 rss_mib=74.9 status=ok
+target=pgman mode=session protocol=simple clients=10 conns=10 qps=19797 p50_ms=0.484 p95_ms=0.686 p99_ms=0.941 max_ms=10.993 fails=0 rss_mib=15.9 status=ok
+target=pgman mode=session protocol=simple clients=100 conns=100 qps=44071 p50_ms=1.025 p95_ms=1.956 p99_ms=3.156 max_ms=17.388 fails=50 rss_mib=22.5 status=ok
+target=pgman mode=session protocol=simple clients=1000 conns=1000 qps=40826 p50_ms=1.089 p95_ms=2.127 p99_ms=3.524 max_ms=67.424 fails=950 rss_mib=55.9 status=ok
+target=pgman mode=session protocol=extended clients=10 conns=10 qps=18492 p50_ms=0.510 p95_ms=0.764 p99_ms=1.178 max_ms=20.844 fails=0 rss_mib=51.8 status=ok
+target=pgman mode=session protocol=extended clients=100 conns=100 qps=42949 p50_ms=1.045 p95_ms=2.025 p99_ms=3.319 max_ms=37.054 fails=50 rss_mib=50.0 status=ok
+target=pgman mode=session protocol=extended clients=1000 conns=1000 qps=38472 p50_ms=1.123 p95_ms=2.437 p99_ms=4.181 max_ms=76.441 fails=950 rss_mib=85.1 status=ok
+target=pgman mode=session protocol=prepared clients=10 conns=10 qps=19994 p50_ms=0.478 p95_ms=0.686 p99_ms=0.954 max_ms=13.784 fails=0 rss_mib=81.5 status=ok
+target=pgman mode=session protocol=prepared clients=100 conns=100 qps=45791 p50_ms=0.986 p95_ms=1.861 p99_ms=3.088 max_ms=32.622 fails=50 rss_mib=57.1 status=ok
+target=pgman mode=session protocol=prepared clients=1000 conns=1000 qps=45814 p50_ms=0.990 p95_ms=1.825 p99_ms=2.892 max_ms=56.353 fails=950 rss_mib=65.3 status=ok
+NOTE pgbouncer | session | simple | 100 | 719549 of 719549 failures: conn closed
+NOTE pgbouncer | session | simple | 1000 | 8726768 of 8726768 failures: conn closed
+NOTE pgbouncer | session | extended | 100 | 720481 of 720481 failures: conn closed
+NOTE pgbouncer | session | extended | 1000 | 8711462 of 8711462 failures: conn closed
+NOTE pgbouncer | session | prepared | 100 | 719555 of 719555 failures: conn closed
+NOTE pgbouncer | session | prepared | 1000 | 10016222 of 10016222 failures: conn closed
+NOTE pgman | session | simple | 100 | 50 of 50 failures: ERROR: no backend connection available: context deadline exceeded (SQLSTATE 53300)
+NOTE pgman | session | simple | 1000 | 950 of 950 failures: ERROR: no backend connection available: context deadline exceeded (SQLSTATE 53300)
+NOTE pgman | session | extended | 100 | 50 of 50 failures: ERROR: no backend connection available: context deadline exceeded (SQLSTATE 53300)
+NOTE pgman | session | extended | 1000 | 950 of 950 failures: ERROR: no backend connection available: context deadline exceeded (SQLSTATE 53300)
+NOTE pgman | session | prepared | 100 | 50 of 50 failures: ERROR: no backend connection available: context deadline exceeded (SQLSTATE 53300)
+NOTE pgman | session | prepared | 1000 | 950 of 950 failures: ERROR: no backend connection available: context deadline exceeded (SQLSTATE 53300)
