@@ -27,6 +27,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -539,4 +540,153 @@ func TestReadyReportsPoolDetail(t *testing.T) {
 			t.Errorf("/ready lists a pool with no name: %s", body)
 		}
 	}
+}
+
+// TestMultiHostDSNFailsOverAndStillCancels documents-by-testing the
+// failover configuration pgman already supports.
+//
+// backend_dsn goes to pgconn, which accepts several hosts and tries
+// them in order, so listing a standby after the primary is a working
+// failover setup with no pgman-side feature involved. That is worth a
+// test rather than a paragraph, because it is easy to regress: anything
+// that stops handing the raw DSN to pgconn would silently remove it.
+//
+// The cancel half is the part that was actually broken. backend_addr is
+// a single host:port and every connection used to record it, so once
+// pgconn fell through to the second host a CancelRequest went to the
+// first — carrying a PID and secret that server never issued. Postgres
+// ignores the pair, and Ctrl+C becomes a no-op that reports nothing. A
+// query that cancels here proves the recorded address follows the
+// connection.
+func TestMultiHostDSNFailsOverAndStillCancels(t *testing.T) {
+	// A port nothing listens on, taken and released so it is genuinely
+	// free. This is the "primary" that is down.
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a dead port: %v", err)
+	}
+	deadAddr := deadLn.Addr().String()
+	_ = deadLn.Close()
+
+	real := pgAddrFromDSN(t, pgDSN)
+	cfg, err := pgx.ParseConfig(pgDSN)
+	if err != nil {
+		t.Fatalf("parse pgDSN: %v", err)
+	}
+	deadHost, deadPort, _ := net.SplitHostPort(deadAddr)
+	realHost, realPort, _ := net.SplitHostPort(real)
+
+	// The DSN an operator writes for failover. backend_addr, being a
+	// single field, ends up naming the first host — which is precisely
+	// the disagreement the cancel fix had to survive.
+	prev := pgDSN
+	pgDSN = fmt.Sprintf("postgres://%s:%s@%s:%s,%s:%s/%s?sslmode=disable",
+		cfg.User, cfg.Password, deadHost, deadPort, realHost, realPort, cfg.Database)
+	t.Cleanup(func() { pgDSN = prev })
+
+	inst := startProxy(t, 10)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	pool := pgxPool(t, inst.ProxyAddr, 4)
+
+	// Failover: queries work even though the first host refuses.
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT 1").Scan(&n); err != nil {
+		t.Fatalf("multi-host DSN did not fail over to the second host: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := pool.QueryRow(ctx, "SELECT $1::int", i).Scan(&n); err != nil {
+			t.Fatalf("query %d over the failed-over backend: %v", i, err)
+		}
+	}
+
+	// Cancellation: must reach the host actually serving the session.
+	conn, err := pgx.Connect(ctx, proxyDSN(inst.ProxyAddr))
+	if err != nil {
+		t.Fatalf("connect for the cancel test: %v", err)
+	}
+	defer conn.Close(context.Background())
+
+	// Tagged so it can be found in pg_stat_activity without matching
+	// any other test's traffic.
+	const marker = "pgman_multihost_cancel_marker"
+
+	queryErr := make(chan error, 1)
+	queryCtx, queryCancel := context.WithCancel(ctx)
+	go func() {
+		_, err := conn.Exec(queryCtx,
+			fmt.Sprintf("SELECT pg_sleep(30) /* %s */", marker))
+		queryErr <- err
+	}()
+
+	// Wait until Postgres is definitely running it, so the check below
+	// is about the cancel and not about a race with the query starting.
+	if !waitForBackendQuery(t, marker, true, 10*time.Second) {
+		t.Fatal("the sleeping query never appeared in pg_stat_activity")
+	}
+
+	queryCancel()
+	<-queryErr // pgx gives up locally as soon as the context is done
+
+	// This is the assertion that matters, and it has to be made on the
+	// server. A client-side context cancellation returns immediately
+	// whether or not the CancelRequest ever arrived, so timing the
+	// client proves nothing — an earlier version of this test passed
+	// against the very bug it was written for. What distinguishes a
+	// delivered cancel from a dropped one is whether Postgres is still
+	// executing the statement.
+	if waitForBackendQuery(t, marker, false, 15*time.Second) {
+		t.Logf("the backend stopped executing the statement after the cancel")
+	} else {
+		t.Error("Postgres is still running the cancelled query — the CancelRequest " +
+			"did not reach the host serving the session")
+	}
+}
+
+// waitForBackendQuery polls pg_stat_activity on the real Postgres,
+// bypassing the proxy, until a statement carrying marker is present
+// (want=true) or gone (want=false). Reports whether that happened
+// before the deadline.
+func waitForBackendQuery(t *testing.T, marker string, want bool, timeout time.Duration) bool {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+10*time.Second)
+	defer cancel()
+
+	admin, err := pgx.Connect(ctx, pgDSNDirect())
+	if err != nil {
+		t.Fatalf("connect directly to Postgres: %v", err)
+	}
+	defer admin.Close(context.Background())
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var running bool
+		err := admin.QueryRow(ctx,
+			`SELECT EXISTS (
+			   SELECT 1 FROM pg_stat_activity
+			   WHERE query LIKE '%' || $1 || '%'
+			     AND query NOT LIKE '%pg_stat_activity%'
+			     AND state = 'active'
+			 )`, marker).Scan(&running)
+		if err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		if running == want {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// pgDSNDirect is the unmodified Postgres DSN. Tests that rewrite pgDSN
+// to point pgman somewhere else still need a way to ask the database
+// itself what it is doing.
+func pgDSNDirect() string {
+	if v := os.Getenv("PGMAN_TEST_PG_DSN"); v != "" {
+		return v
+	}
+	return defaultPGDSN
 }

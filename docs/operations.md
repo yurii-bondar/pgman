@@ -216,6 +216,80 @@ stops receiving traffic.
 
 ---
 
+## Failover to a second host
+
+`backend_dsn` is handed to `pgconn` unchanged, and `pgconn` accepts more
+than one host. Listing several is therefore a working failover
+configuration with no pgman-side feature involved:
+
+```yaml
+pools:
+  shop:
+    backend_dsn: "postgres://app:secret@pg-1:5432,pg-2:5432,pg-3:5432/shop?sslmode=verify-full"
+    backend_addr: "pg-1:5432"
+    limit: 50
+```
+
+Hosts are tried **in order**, and the first one that accepts wins. When
+`pg-1` is down every new backend connection goes to `pg-2`; when `pg-1`
+comes back, new connections go to it again. Connections already open are
+not moved — use `RECONNECT` if you want them retired early.
+
+Covered end to end by `TestMultiHostDSNFailsOverAndStillCancels`.
+
+### Picking a writable host
+
+`pgconn` also honours `target_session_attrs`, so a primary/standby pair
+does not need pgman to know which is which:
+
+| Value | Accepts a host when |
+| --- | --- |
+| `read-write` | the session can write (`transaction_read_only` is off) |
+| `primary` | the server is not in recovery |
+| `read-only` | the session cannot write |
+| `standby` | the server is in recovery |
+| `prefer-standby` | a standby if one answers, otherwise any host |
+| `any` | it accepts at all — the default |
+
+`read-write` and `primary` usually pick the same host but ask different
+questions, and they disagree on a primary running with
+`default_transaction_read_only = on`: that host is not in recovery, so
+`primary` takes it, while `read-write` rejects it. Use `read-write` when
+what you need is a connection that can write, which is normally the
+case.
+
+```yaml
+backend_dsn: "postgres://app:secret@pg-1:5432,pg-2:5432/shop?sslmode=verify-full&target_session_attrs=read-write"
+```
+
+After a failover promotes `pg-2`, new connections follow the promotion
+on their own, because each dial re-evaluates the condition.
+
+### What this is not
+
+**It is not load balancing.** Hosts are a priority list, not a rotation:
+while the first host is healthy it takes every connection. If you want
+traffic spread across replicas, this does not do it.
+
+**`backend_addr` stays a single host**, and it is not the host
+connections are recorded against — that comes from the connection's own
+peer, so cancellation follows a failover correctly. What `backend_addr`
+still drives:
+
+- the DNS watcher, which therefore watches **only that one host**. A
+  record change behind `pg-2` or `pg-3` will not trigger a reconnect.
+- the `host` and `port` columns of `SHOW DATABASES`.
+- the SSRF check on pools created through the admin API.
+
+Set it to the host you consider primary. It is a label and a watch
+target, not the dial list.
+
+**Health checks are per pool, not per host.** The circuit breaker counts
+consecutive dial failures for the pool as a whole, so it opens only when
+*every* listed host is unreachable — which is the behaviour you want,
+but it means a single dead host is invisible in `pgman_pool_circuit_open`.
+Watch `pgman_pool_dial_errors_total` for that.
+
 ## Going back to PgBouncer
 
 Worth writing down before you need it.

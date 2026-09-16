@@ -85,7 +85,8 @@ connections, pgman queues them and fails them with `53300` on
 these numbers imply: what `DISCARD ALL` actually clears and what turning
 it off gives away, how many client connections are demonstrated (5 000)
 versus assumed, why pgman needs CPU headroom, what an outage looks like
-from `/ready`, and how to go back to PgBouncer if you want to.
+from `/ready`, how to fail over to a second host without any pgman-side
+feature, and how to go back to PgBouncer if you want to.
 
 ## Quick start
 
