@@ -1,0 +1,4 @@
+go test fuzz v1
+string("host 0 0 All trust")
+string("0")
+string("0")

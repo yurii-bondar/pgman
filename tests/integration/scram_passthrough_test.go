@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -221,4 +222,93 @@ func TestScramPassthroughPoolAppearsOnFirstUse(t *testing.T) {
 	if !strings.Contains(after, `pool="pgman_test/pgman_pt_alice"`) {
 		t.Error("the per-user pool is not visible in metrics after first use")
 	}
+}
+
+// TestScramPassthroughUnderConcurrentUsers is the case the sequential
+// tests above cannot reach.
+//
+// TestScramPassthroughKeepsIdentitiesApartAcrossPoolReuse cycles users
+// one at a time, which proves the per-user pools are keyed correctly.
+// It says nothing about what happens when several users authenticate,
+// route and run at the same moment — and that is the only window in
+// which pgman could hand a session the wrong identity, because the
+// ClientKey store is written during authentication and read during
+// routing.
+//
+// Getting this wrong is not a dropped connection. It is one client's
+// statements executing as another client's role, underneath row-level
+// security and every GRANT on the database. So the assertion is exact:
+// every query, from every goroutine, must see its own current_user.
+func TestScramPassthroughUnderConcurrentUsers(t *testing.T) {
+	const (
+		users       = 6
+		concurrency = 4
+		rounds      = 8
+	)
+
+	authUsers := make(map[string]string, users)
+	creds := make([][2]string, 0, users)
+	for i := 0; i < users; i++ {
+		role := fmt.Sprintf("pgman_ptc_%d", i)
+		password := fmt.Sprintf("secret_%d", i)
+		createRole(t, role, password)
+		authUsers[role] = rolpasswordFor(t, role)
+		creds = append(creds, [2]string{role, password})
+	}
+
+	// A pool limit below the number of users, so per-user pools are
+	// created, evicted and recreated while other users are mid-flight.
+	inst := startProxyWithPassthrough(t, authUsers, 2)
+
+	var wg sync.WaitGroup
+	errCh := make(chan string, users*concurrency*rounds)
+
+	for _, c := range creds {
+		for w := 0; w < concurrency; w++ {
+			wg.Add(1)
+			go func(role, password string) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+
+				dsn := fmt.Sprintf("postgres://%s:%s@%s/pgman_test?sslmode=disable",
+					role, password, inst.ProxyAddr)
+				conn, err := pgx.Connect(ctx, dsn)
+				if err != nil {
+					errCh <- fmt.Sprintf("%s: connect: %v", role, err)
+					return
+				}
+				defer conn.Close(context.Background())
+
+				for r := 0; r < rounds; r++ {
+					var got string
+					if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&got); err != nil {
+						errCh <- fmt.Sprintf("%s round %d: %v", role, r, err)
+						return
+					}
+					if got != role {
+						errCh <- fmt.Sprintf(
+							"IDENTITY CROSSED: %s round %d ran as %q", role, r, got)
+						return
+					}
+				}
+			}(c[0], c[1])
+		}
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	var failures []string
+	for msg := range errCh {
+		failures = append(failures, msg)
+	}
+	if len(failures) > 0 {
+		for _, f := range failures {
+			t.Error(f)
+		}
+		t.Fatalf("%d of %d concurrent sessions failed", len(failures), users*concurrency)
+	}
+	t.Logf("%d users × %d connections × %d queries all ran as themselves",
+		users, concurrency, rounds)
 }
