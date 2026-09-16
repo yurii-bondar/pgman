@@ -810,26 +810,39 @@ func (p *Pool) warmUp() {
 // up. Mirrors PgBouncer's PAUSE.
 //
 // Double-Pause is a cheap no-op.
+//
+// The flag and the channel are changed together under pauseMu, and that
+// pairing is the whole correctness argument. Setting paused=true first
+// and swapping the channel afterwards leaves a window in which a
+// concurrent Resume wins its own compare-and-swap, reads the *previous*
+// resumeCh — which is already closed — and closes it a second time.
+// That panics, and since PAUSE and RESUME are both reachable from the
+// admin API, two operators or one retrying script could take the whole
+// proxy down with it.
 func (p *Pool) Pause() {
-	if !p.paused.CompareAndSwap(false, true) {
-		return
-	}
-	// Swap resumeCh under pauseMu so any concurrent Resume reads the
-	// same channel we're about to close.
 	p.pauseMu.Lock()
-	p.resumeCh = make(chan struct{})
+	paused := p.paused.CompareAndSwap(false, true)
+	if paused {
+		p.resumeCh = make(chan struct{})
+	}
 	p.pauseMu.Unlock()
-	p.emit("pause", nil)
+
+	// Outside the lock: emit hands control to caller-supplied code, and
+	// nothing it might do should be able to block Pause's counterpart.
+	if paused {
+		p.emit("pause", nil)
+	}
 }
 
 // Resume undoes Pause: closes the current resumeCh, waking every
 // parked Acquire in one broadcast. Safe to call when not paused
 // (no-op then).
 func (p *Pool) Resume() {
+	p.pauseMu.Lock()
 	if !p.paused.CompareAndSwap(true, false) {
+		p.pauseMu.Unlock()
 		return
 	}
-	p.pauseMu.Lock()
 	ch := p.resumeCh
 	// Install a pre-closed channel so a later Pause-then-Acquire
 	// without an intervening Resume can't race (Acquire loads
@@ -840,6 +853,7 @@ func (p *Pool) Resume() {
 	close(closed)
 	p.resumeCh = closed
 	p.pauseMu.Unlock()
+
 	close(ch)
 	p.emit("resume", nil)
 }

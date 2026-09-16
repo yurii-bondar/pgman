@@ -301,3 +301,58 @@ func TestPoolCloseRacesEveryOperation(t *testing.T) {
 		mu.Unlock()
 	}
 }
+
+// TestPauseAndResumeRaceDoesNotPanic is the regression for a panic that
+// took the whole process down.
+//
+// Pause used to set the paused flag and only then swap the resume
+// channel under pauseMu. In the window between those two steps a
+// concurrent Resume would win its own compare-and-swap, read the
+// previous resumeCh — already closed — and close it again. "close of
+// closed channel" is not recoverable, and PAUSE and RESUME are both
+// reachable from the admin API and the admin SQL console, so two
+// operators during an incident, or one script that retries, could stop
+// the proxy outright.
+//
+// Found by TestPoolCloseRacesEveryOperation, which fires Pause,
+// Reconnect and Resume from separate goroutines. Pinned separately here
+// because a chaos test that happens to catch a bug is not the same as a
+// test that says what the bug was.
+func TestPauseAndResumeRaceDoesNotPanic(t *testing.T) {
+	for attempt := 0; attempt < 200; attempt++ {
+		p := New(func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+			return client, nil
+		}, 2, nil, nil)
+
+		var wg sync.WaitGroup
+		// Several of each, in both orders, so the interleaving that
+		// matters is reached quickly rather than eventually.
+		for i := 0; i < 4; i++ {
+			wg.Add(2)
+			go func() { defer wg.Done(); p.Pause() }()
+			go func() { defer wg.Done(); p.Resume() }()
+		}
+		wg.Wait()
+
+		// Whatever the interleaving settled on, the pool must still be
+		// usable: a pool left paused with nobody to resume it is a
+		// quieter version of the same outage.
+		p.Resume()
+		if p.IsPaused() {
+			t.Fatalf("attempt %d: pool stayed paused after a final Resume", attempt)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		conn, err := p.Acquire(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("attempt %d: pool unusable after the race: %v", attempt, err)
+		}
+		p.Release(conn)
+
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = p.Close(closeCtx)
+		closeCancel()
+	}
+}
