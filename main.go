@@ -1034,7 +1034,7 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 		}
 		return &backendConn{
 			Conn: hijacked.Conn,
-			addr: addr,
+			addr: connectedAddr(hijacked.Conn, addr),
 			pid:  hijacked.PID,
 			// v5's SecretKey is already []byte; the type change ripples
 			// through backendConn/session/sendRealCancelRequest.
@@ -1042,6 +1042,30 @@ func newDialBackend(dsn, addr string, requireTLS bool) pool.Dialer {
 			cancelTLS: cancelTLS,
 		}, nil
 	}
+}
+
+// connectedAddr returns the address a connection actually reached,
+// falling back to the configured one when it cannot be determined.
+//
+// It matters because backend_dsn is handed to pgconn, which accepts
+// several hosts and tries them in order — so a multi-host DSN is a
+// working failover configuration. backend_addr is a single host:port,
+// and the two disagree the moment the first host is down. A cancel sent
+// to the configured address then carries a PID and secret that only the
+// other server issued: Postgres validates the pair, ignores it, and
+// Ctrl+C silently does nothing.
+//
+// Only TCP peers are used. sendRealCancelRequest dials "tcp", so a unix
+// socket's path would be useless to it, and the configured value is no
+// worse.
+func connectedAddr(conn net.Conn, configured string) string {
+	if conn == nil {
+		return configured
+	}
+	if tcp, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return tcp.String()
+	}
+	return configured
 }
 
 // cancelTLSConfigFor decides how a later CancelRequest for this backend

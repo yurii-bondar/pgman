@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestValidateBackendAddrRejectsPivotTargets covers the SSRF surface the
@@ -159,4 +163,65 @@ func TestAdminLoopbackFallbackRejectsForwardedRequests(t *testing.T) {
 				"proxy must not inherit the loopback exemption", rec.Code)
 		}
 	})
+}
+
+// TestBackendConnRecordsTheHostItActuallyReached is the regression for a
+// cancel that silently stops working.
+//
+// backend_dsn goes to pgconn, which accepts several hosts and tries them
+// in order — so `postgres://u@pg-1:5432,pg-2:5432/db` is a working
+// failover configuration today. backend_addr, meanwhile, is a single
+// host:port, and it was what every backendConn recorded.
+//
+// The two disagree the moment the first host is down. cancelSession
+// sends the CancelRequest to the recorded address, so it arrives at
+// pg-1 carrying a PID and secret that only pg-2 issued. Postgres
+// validates the pair and ignores it, which means Ctrl+C does nothing,
+// reports nothing, and looks like the query is simply slow.
+//
+// The address a connection records has to be the one it is connected
+// to, not the one the config nominated.
+func TestBackendConnRecordsTheHostItActuallyReached(t *testing.T) {
+	alive := startFakePG(t, fakePGOptions{auth: fakeAuthTrust})
+
+	// A port nothing listens on, so pgconn has to fall through to the
+	// second host. Taken and released so it is genuinely free.
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a dead port: %v", err)
+	}
+	deadAddr := deadLn.Addr().String()
+	_ = deadLn.Close()
+
+	deadHost, deadPort, _ := net.SplitHostPort(deadAddr)
+	aliveHost, alivePort, _ := net.SplitHostPort(alive.addr())
+
+	dsn := fmt.Sprintf("postgres://app@%s:%s,%s:%s/db1?sslmode=disable",
+		deadHost, deadPort, aliveHost, alivePort)
+
+	// backend_addr names the first host, exactly as an operator would
+	// write it: it is a single field and the DSN has two hosts.
+	dial := newDialBackend(dsn, deadAddr, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, err := dial(ctx)
+	if err != nil {
+		t.Fatalf("dial across the fallback: %v", err)
+	}
+	defer conn.Close()
+
+	bc, ok := conn.(*backendConn)
+	if !ok {
+		t.Fatalf("dialler returned %T, want *backendConn", conn)
+	}
+	if bc.addr == deadAddr {
+		t.Fatalf("the connection recorded %s, the host it failed to reach — "+
+			"a CancelRequest would go there instead of to %s", bc.addr, alive.addr())
+	}
+	if bc.addr != alive.addr() {
+		t.Errorf("recorded address %s, want %s (the host actually connected to)",
+			bc.addr, alive.addr())
+	}
 }
