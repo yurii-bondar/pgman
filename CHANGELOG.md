@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/yurii-bondar/pgman/compare/v1.0.1...v1.0.2) (2026-09-16)
+
+### Bug fixes
+
+* panic when PAUSE and RESUME race on the same pool ([62b9769](https://github.com/yurii-bondar/pgman/commit/62b9769206675037bd30247ddc3600c4ccb0c4e0))
+* record the backend host a connection actually reached ([c6a18f5](https://github.com/yurii-bondar/pgman/commit/c6a18f58ff3beeb204f40820c520205a75611798))
+
 ## [1.0.1](https://github.com/yurii-bondar/pgman/compare/v1.0.0...v1.0.1) (2026-09-16)
 
 ### Bug fixes
