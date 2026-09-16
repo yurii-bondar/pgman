@@ -1,3 +1,13 @@
+## [1.0.1](https://github.com/yurii-bondar/pgman/compare/v1.0.0...v1.0.1) (2026-09-16)
+
+### Bug fixes
+
+* enable_pprof panic and unvalidated SCRAM verifiers ([c2ed631](https://github.com/yurii-bondar/pgman/commit/c2ed631062416ce425aa94c03dada892622d3545))
+
+### Performance
+
+* reuse pgproto3.Frontend for the life of a backend connection ([60343e8](https://github.com/yurii-bondar/pgman/commit/60343e840c84ef37916c17935580837d2d9ab1f5))
+
 ## 1.0.0 (2026-09-15)
 
 ### ⚠ BREAKING CHANGES
