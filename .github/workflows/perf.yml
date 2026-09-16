@@ -110,6 +110,48 @@ jobs:
 
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      # Allocation accounting for the proxy process, not the client.
+      #
+      # The micro-benchmarks above report the *test binary's* allocs/op,
+      # which is pgx — pgman is a subprocess and -memprofile cannot see
+      # it. This step reads pgman's own heap through its pprof endpoint,
+      # so a change that doubles the garbage produced per query is
+      # visible in the job summary instead of six months later as a GC
+      # pause somebody else has to diagnose.
+      - name: Allocation rate (pgman's own heap)
+        working-directory: tests/integration
+        env:
+          PGMAN_PROFILE_DIR: ${{ github.workspace }}/profiles
+        run: |
+          set -euo pipefail
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Allocation rate per query" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          go test -tags integration -timeout 10m -v \
+            -run '^TestAllocationRatePerQuery$' . \
+            2>&1 | grep -E 'queries:|allocated:|allocation rate|PASS|FAIL' \
+                 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Top allocation sites, so the summary says *where* as well as
+          # how much.
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Top allocation sites</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          go tool pprof -top -nodecount=15 -sample_index=alloc_space \
+            "$PGMAN_PROFILE_DIR/allocs.pb.gz" 2>/dev/null \
+            | tee -a "$GITHUB_STEP_SUMMARY" || echo "(profile unavailable)"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pprof-profiles
+          path: profiles/
+          if-no-files-found: ignore
+
       - name: Soak (pgbench-style realistic mix)
         working-directory: tests/integration
         env:

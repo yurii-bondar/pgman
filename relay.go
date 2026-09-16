@@ -254,7 +254,7 @@ func relayImpl(client net.Conn, pg *pgproto3.Backend, p *pool.Pool, sess *sessio
 				continue
 			}
 			backend = conn.(*backendConn)
-			fe = pgproto3.NewFrontend(backend, backend)
+			fe = backend.frontend()
 			sess.setBackend(backend)
 
 			if err := adoptBackend(fe, backend, sess, opts); err != nil {

@@ -141,6 +141,12 @@ func dialAndHandshake(ctx context.Context, cfg *pgconn.Config, target connectTar
 		pid:       pid,
 		secretKey: secret,
 		cancelTLS: cancelTLS,
+		// The handshake's own Frontend carries on as the connection's
+		// Frontend rather than being dropped here. Handing it over is
+		// both one fewer buffer allocation and the only way to be sure
+		// no byte the handshake read ahead is stranded in a reader
+		// nobody will look at again.
+		fe: fe,
 	}, nil
 }
 

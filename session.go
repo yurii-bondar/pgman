@@ -31,6 +31,29 @@ var cancelDialTimeout = 5 * time.Second
 // empty map, per stripe struct) without a real return past that point.
 const sessionShardCount = 32
 
+// frontend returns the connection's protocol reader/writer, creating it
+// on first use. Lazy rather than required at construction so the many
+// tests that build a backendConn around a pipe keep working unchanged.
+func (b *backendConn) frontend() *pgproto3.Frontend {
+	if b.fe == nil {
+		b.fe = pgproto3.NewFrontend(b.Conn, b.Conn)
+	}
+	return b.fe
+}
+
+// frontendFor reuses a connection's own Frontend when it has one.
+//
+// The pool deals in net.Conn, so code reached through it — the health
+// check especially — cannot assume a backendConn. When it is one,
+// building a second Frontend over the same socket both allocates and
+// risks stranding bytes in the buffer of whichever one is discarded.
+func frontendFor(conn net.Conn) *pgproto3.Frontend {
+	if b, ok := conn.(*backendConn); ok {
+		return b.frontend()
+	}
+	return pgproto3.NewFrontend(conn, conn)
+}
+
 // backendConn decorates a hijacked real-Postgres connection with the
 // identity Postgres gave it (PID + secret) — needed only to route a
 // real CancelRequest to this exact backend process later. Embedding
@@ -55,6 +78,26 @@ type backendConn struct {
 	addr      string
 	pid       uint32
 	secretKey []byte
+
+	// fe is this connection's protocol reader/writer, created once at
+	// dial and reused for its whole life.
+	//
+	// It used to be built fresh on every Acquire, and separately again
+	// on every health check. Profiling the proxy's own heap
+	// (tests/integration/alloc_profile_test.go) put 72% of all bytes
+	// allocated under pgproto3.NewFrontend: each one takes a buffer
+	// from pgx's iobufpool, and in transaction pooling that is a
+	// per-transaction cost, not a per-connection one.
+	//
+	// Reuse is also the safer shape. A Frontend owns a read buffer, so
+	// replacing it discards anything already read off the socket but
+	// not yet consumed. Nothing depends on that today only because
+	// backends are released at a clean ReadyForQuery boundary.
+	//
+	// Not guarded by a mutex: a backend is owned by exactly one session
+	// between Acquire and Release, and the health check runs inside
+	// Acquire before any session can see it.
+	fe *pgproto3.Frontend
 
 	// stateOwner is the id of the session whose session-level state this
 	// connection currently carries: its GUCs, prepared statements, temp

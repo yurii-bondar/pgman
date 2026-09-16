@@ -1113,7 +1113,7 @@ func healthCheckWithTimeout(conn net.Conn, timeout time.Duration) error {
 	}
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
-	fe := pgproto3.NewFrontend(conn, conn)
+	fe := frontendFor(conn)
 	fe.Send(&pgproto3.Query{String: "SELECT 1"})
 	if err := fe.Flush(); err != nil {
 		return fmt.Errorf("send: %w", err)
