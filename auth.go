@@ -342,6 +342,32 @@ func ParseSCRAMVerifier(s string) (scram.StoredCredentials, error) {
 		return scram.StoredCredentials{}, fmt.Errorf("invalid server key: %w", err)
 	}
 
+	// Everything above proves the string has the right shape. These
+	// checks prove the credential inside it can actually be used.
+	//
+	// The distinction matters because this runs at config load. A
+	// verifier that parses but cannot match anything makes the process
+	// start, report healthy, and then reject that user's every login —
+	// with the cause sitting in a YAML file that looks fine. Rejecting
+	// it here turns a permanent, silent outage for one role into a
+	// startup error that names the field.
+	//
+	// Found by FuzzParseSCRAMVerifier: strconv.Atoi happily returns 0
+	// and negative numbers, and an iteration count is a PBKDF2 work
+	// factor.
+	if iters <= 0 {
+		return scram.StoredCredentials{}, fmt.Errorf("iteration count must be positive, got %d", iters)
+	}
+	if len(salt) == 0 {
+		return scram.StoredCredentials{}, fmt.Errorf("salt is empty")
+	}
+	if len(storedKey) != sha256.Size {
+		return scram.StoredCredentials{}, fmt.Errorf("stored key is %d bytes, want %d", len(storedKey), sha256.Size)
+	}
+	if len(serverKey) != sha256.Size {
+		return scram.StoredCredentials{}, fmt.Errorf("server key is %d bytes, want %d", len(serverKey), sha256.Size)
+	}
+
 	return scram.StoredCredentials{
 		KeyFactors: scram.KeyFactors{Salt: string(salt), Iters: iters},
 		StoredKey:  storedKey,

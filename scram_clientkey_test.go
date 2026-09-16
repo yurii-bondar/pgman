@@ -15,7 +15,10 @@ import (
 // Using the library on both sides is the point: recoverClientKey has to
 // cut these messages exactly the way the library's own verification
 // does, and only a genuine exchange proves that.
-func runSCRAM(t *testing.T, password string, cb *scram.ChannelBinding) (scramExchange, scram.StoredCredentials) {
+//
+// testing.TB rather than *testing.T so the fuzz targets can seed their
+// corpus with a real exchange instead of a hand-written literal.
+func runSCRAM(t testing.TB, password string, cb *scram.ChannelBinding) (scramExchange, scram.StoredCredentials) {
 	t.Helper()
 
 	client, err := scram.SHA256.NewClient("user", password, "")

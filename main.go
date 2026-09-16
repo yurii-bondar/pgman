@@ -581,11 +581,21 @@ func newAdminServer(ctx context.Context, cfg *Config, configPath string, poolReg
 		// pprof is registered here so it inherits adminAuth below —
 		// exposing a live heap dump publicly is a straightforward
 		// pre-attack recon vector.
-		mux.HandleFunc("/debug/pprof/", pprof.Index)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		//
+		// The "GET " prefixes are required, not stylistic. Go 1.22's
+		// ServeMux treats two patterns as conflicting when neither is
+		// strictly more specific, and a method-less "/debug/pprof/"
+		// against the "GET /" above is exactly that case: one wins on
+		// method, the other on path. Registering it panics at startup,
+		// which meant enable_pprof could not be turned on at all.
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		// Symbol is documented as accepting POST as well, and pprof's
+		// own tooling uses it when resolving a large address list.
+		mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
 	}
 
 	oidcCtx, oidcCancel := context.WithTimeout(ctx, 15*time.Second)
